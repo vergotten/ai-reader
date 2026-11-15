@@ -1,0 +1,31 @@
+# Python environments and caches
+.venv/
+.venv-*/
+__pycache__/
+*.pyc
+*.egg-info/
+.ruff_cache/
+
+# build output: installer staging and the installers themselves
+build/
+dist/
+
+# downloaded models (several GB; the app or fetch_models downloads them again)
+models/
+
+# your own books, recordings and other local files
+data/
+books/*
+!books/README.md
+*.at5
+_to_delete/
+
+# editors and OS
+.idea/
+.vscode/
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# unfinished export files
+*.part
