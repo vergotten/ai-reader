@@ -515,11 +515,73 @@ class VoicesDialog(QDialog):
         self.settings.setValue("train/last_dir", str(Path(files[0]).parent))
         self._prepare(files)
 
+    def _missing_for_recordings(self, files: list[str]) -> tuple[list[str], list[str]]:
+        """(packages the app can install itself, problems it can't fix) for turning these recordings into a voice."""
+        import importlib.util
+
+        installable, blocking = [], []
+        if importlib.util.find_spec("torch") is None:
+            blocking.append("PyTorch (полная версия программы: uv sync --extra train или build-installer.bat)")
+        if importlib.util.find_spec("transformers") is None:
+            installable.append("transformers")
+        exotic = (".m4a", ".aac", ".mp4", ".webm", ".wma", ".amr", ".3gp")
+        if any(f.lower().endswith(exotic) for f in files) and importlib.util.find_spec("av") is None and not shutil.which("ffmpeg"):
+            installable.append("av")
+        return installable, blocking
+
+    def _install_then(self, modules: list[str], then: Callable[[], None]) -> None:
+        from ..installer import PACKAGES, install
+
+        requirements = [r for m in modules for r in PACKAGES[m]]
+        self._busy = "prep"
+        self._update_controls()
+        sig = _Signals()
+        sig.log.connect(self._log)
+
+        def finished(_result, error) -> None:
+            self._busy = None
+            self._update_controls()
+            if error is not None:
+                QMessageBox.critical(self, "Не удалось установить", str(error))
+                return
+            then()
+
+        sig.done.connect(finished)
+        self._install_signals = sig
+
+        def target() -> None:
+            try:
+                install(requirements, sig.log.emit)
+            except BaseException as e:  # noqa: BLE001
+                sig.done.emit(None, e)
+            else:
+                sig.done.emit(None, None)
+
+        threading.Thread(target=target, daemon=True, name="ai-reader-install").start()
+
     def _prepare(self, files: list[str]) -> None:
         if not self.voice or self.busy:
             return
         if self._main_busy():
             QMessageBox.information(self, "Занято", "Дождитесь окончания чтения или экспорта в главном окне.")
+            return
+        installable, blocking = self._missing_for_recordings(files)
+        if blocking:
+            QMessageBox.warning(
+                self, "Не хватает компонентов",
+                "Чтобы сделать голос из записей, нужна полная версия программы — в этой сборке нет:\n• "
+                + "\n• ".join(blocking)
+                + "\n\nГолосом из записей говорят движки F5-TTS и XTTS-v2, им тоже нужна полная версия.",
+            )
+            return
+        if installable:
+            answer = QMessageBox.question(
+                self, "Нужно установить пакеты",
+                "Для распознавания записей не хватает пакетов: " + ", ".join(installable)
+                + ".\nУстановить их сейчас? Нужен интернет; ход установки — в журнале.",
+            )
+            if answer == QMessageBox.StandardButton.Yes:
+                self._install_then(installable, lambda: self._prepare(files))
             return
         self._release_gpu()
         voice, device, stress = self.voice, self._device_preference(), self.stress_check.isChecked()

@@ -143,6 +143,7 @@ def prepare_dataset(
     existing = [int(m.group(1)) for c in voice.clips if (m := re.search(r"(\d+)\.wav$", c.file))]
     number = max(existing, default=0)
     new: list[tuple[Clip, np.ndarray]] = []
+    read_errors: list[str] = []
 
     for n, path in enumerate(files, 1):
         if cancelled():
@@ -151,7 +152,9 @@ def prepare_dataset(
         try:
             audio = load_audio(path, SAMPLE_RATE)
         except RuntimeError as e:
-            log(str(e))
+            message = f"{os.path.basename(path)}: {e}"
+            read_errors.append(message)
+            log(message)
             continue
         if len(audio) < SAMPLE_RATE:
             log(f"Пропуск (короче секунды): {os.path.basename(path)}")
@@ -167,7 +170,11 @@ def prepare_dataset(
             new.append((Clip(rel, "", round(len(piece) / SAMPLE_RATE, 2), True), piece))
 
     if not new:
-        raise RuntimeError("В записях не найдено речи (или их не удалось прочитать — см. журнал)")
+        if read_errors:
+            details = "\n".join(read_errors[:5])
+            extra = f"\n…и ещё {len(read_errors) - 5} файл(ов)." if len(read_errors) > 5 else ""
+            raise RuntimeError(f"Не удалось прочитать ни одной записи:\n{details}{extra}")
+        raise RuntimeError("В записях не найдено речи. Проверьте, что в файлах слышна речь без длинных пауз.")
 
     _transcribe(new, device_preference, log, progress, cancelled)
 

@@ -60,6 +60,7 @@ class TTSEngine(ABC):
     builtin_stress: bool = False  # puts stresses itself with RUAccent (no need to do it in the pipeline)
     style_controls: tuple[str, ...] = ()  # names of the Style fields this engine reacts to
     max_chars: int = 400
+    min_chunk_chars: int = 0  # shorter sentences are joined to the next one (cloning models garble «Да.»)
     requirements: tuple[str, ...] = ()  # importable module names
     extra: str = ""  # pyproject extra that installs the requirements
     license_notice: str | None = None  # shown once; user must accept before first load

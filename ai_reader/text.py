@@ -18,6 +18,7 @@ class Chunk:
     end: int
     text: str
     pause: float  # seconds of silence after this chunk
+    voice: str | None = None  # None: the narrator's voice (dialogue lines may get another one)
 
 
 def _strip(text: str, s: int, e: int) -> tuple[int, int]:
@@ -69,6 +70,39 @@ def _split_span(text: str, s: int, e: int, max_chars: int, level: int = 0) -> li
     return result
 
 
+_TRAILING_CLOSERS = "»\"”’)] \t"
+
+
+def sentence_pause_for(fragment: str, base: float) -> float:
+    """A narrator breathes longer after a question, an exclamation or a trailing-off «…» than after a full stop,
+    and barely at all inside a sentence that had to be cut at a comma."""
+    tail = fragment.rstrip(_TRAILING_CLOSERS)
+    if tail.endswith(("…", "...")):
+        return base * 1.5
+    if tail.endswith(("?", "!")):
+        return base * 1.2
+    if tail.endswith("."):
+        return base
+    return base * 0.4
+
+
+def _sentences(text: str, s: int, e: int, min_chars: int) -> list[tuple[int, int]]:
+    """Sentences of text[s:e]; ones shorter than min_chars are joined to the next (some engines garble «Да.»)."""
+    out: list[tuple[int, int]] = []
+    for ps, pe in _split_by(text, s, e, _SENTENCE_END):
+        ps, pe = _strip(text, ps, pe)
+        if ps >= pe:
+            continue
+        if out and out[-1][1] - out[-1][0] < min_chars:
+            out[-1] = (out[-1][0], pe)
+        else:
+            out.append((ps, pe))
+    if len(out) > 1 and out[-1][1] - out[-1][0] < min_chars:
+        last = out.pop()
+        out[-1] = (out[-1][0], last[1])
+    return out
+
+
 def chunk_text(
     text: str,
     max_chars: int = 400,
@@ -76,18 +110,30 @@ def chunk_text(
     paragraph_pause: float = 0.5,
     start: int = 0,
     end: int | None = None,
+    min_chars: int = 0,
 ) -> list[Chunk]:
-    """Split text[start:end] into chunks of at most max_chars, preferring sentence, then clause boundaries.
+    """Split text[start:end] into chunks: one sentence each (long ones cut at clauses to fit max_chars).
 
-    Each line is a paragraph. Chunk offsets refer to the original text so the GUI can highlight them.
+    Each line is a paragraph. Every sentence ends with its own pause, so the "pause between phrases"
+    setting really works between phrases (earlier, several sentences went to the engine at once and the
+    model ran them together with its own tiny pause, which sounded rushed).
+    Chunk offsets refer to the original text so the GUI can highlight them.
     """
     end = len(text) if end is None else end
     chunks: list[Chunk] = []
     for m in _PARAGRAPH.finditer(text, start, end):
-        spans = _split_span(text, m.start(), m.end(), max_chars)
-        for i, (s, e) in enumerate(spans):
-            pause = paragraph_pause if i == len(spans) - 1 else sentence_pause
-            chunks.append(Chunk(s, e, text[s:e], pause))
+        sentences = _sentences(text, m.start(), m.end(), min_chars)
+        for si, (ss, se) in enumerate(sentences):
+            spans = _split_span(text, ss, se, max_chars)
+            for i, (s, e) in enumerate(spans):
+                piece = text[s:e]
+                if i < len(spans) - 1:
+                    pause = sentence_pause_for(piece, sentence_pause)
+                elif si == len(sentences) - 1:
+                    pause = paragraph_pause
+                else:
+                    pause = sentence_pause_for(piece, sentence_pause)
+                chunks.append(Chunk(s, e, piece, pause))
     return chunks
 
 
@@ -212,6 +258,11 @@ def normalize(text: str, lang: str = "ru", numbers: bool = True) -> str:
     text = _DASH_IN_SENTENCE.sub(", ", text)
     if numbers:
         text = expand_numbers(text, lang)
+    if lang in ("ru", "uk"):
+        # Russian voices skip Latin letters entirely ("рефери NFL" -> "рефери"); spell them in Cyrillic
+        from .latin import transliterate
+
+        text = transliterate(text)
     return _SPACE_BEFORE_PUNCT.sub(r"\1", " ".join(text.split()))
 
 

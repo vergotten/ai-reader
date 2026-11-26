@@ -30,6 +30,7 @@ class F5Engine(TTSEngine):
     builtin_stress = True  # runs RUAccent itself
     style_controls = ("quality",)
     max_chars = 220  # reference + generated speech should stay under ~25 s, which is what F5 was trained on
+    min_chunk_chars = 25
     requirements = ("f5_tts", "ruaccent", "torch")
     extra = "f5"
     license_notice = (

@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import json
 import threading
 import time
 import traceback
 from pathlib import Path
 from typing import Callable
 
-from PySide6.QtCore import QObject, QSettings, Qt, QUrl, Signal
+from PySide6.QtCore import QObject, QSettings, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import QAction, QActionGroup, QDesktopServices, QFont, QKeySequence, QPalette, QTextCharFormat, QTextCursor
 from PySide6.QtWidgets import (
     QApplication,
@@ -42,9 +43,10 @@ from PySide6.QtWidgets import (
 )
 
 from .. import __version__
-from ..audio import BITRATES, FORMATS
+from ..audio import BITRATES, FORMATS, chapter_chime
 from ..books import FILE_FILTER, Book, load_book
-from ..pipeline import Cancelled, ExportJob, ReadAloud, SynthSettings, make_chunks, needs_stresser, run_export
+from ..installer import PACKAGES, install
+from ..pipeline import Cancelled, ExportJob, ReadAloud, SynthSettings, make_chunks, needs_stresser, prepare_voices, run_export
 from ..stress import PronunciationDictionary, strip_stress, stresser
 from ..tts import EngineManager, TTSEngine
 from ..tts.base import Style
@@ -59,12 +61,14 @@ from .voices_dialog import VoicesDialog
 LANGUAGES = [("ru", "Русский"), ("uk", "Українська"), ("en", "English")]
 DEVICES = [("auto", "Авто (GPU, если есть)"), ("cuda", "GPU (CUDA)"), ("cpu", "CPU")]
 # reading style -> (speed, pitch %, expressiveness %, pause between phrases, pause between paragraphs)
+# pauses now follow every sentence (not every ~500 characters), so these are what you actually hear
 STYLE_PRESETS = {
-    "Обычное": (1.0, 0, 50, 0.15, 0.5),
-    "Спокойное, перед сном": (0.9, -5, 35, 0.3, 0.9),
-    "Выразительное, художественное": (0.95, 0, 75, 0.25, 0.7),
-    "Быстрое, для нон-фикшн": (1.2, 0, 40, 0.1, 0.35),
+    "Обычное": (0.95, 0, 50, 0.35, 0.8),
+    "Спокойное, перед сном": (0.85, -5, 35, 0.5, 1.1),
+    "Выразительное, художественное": (0.9, 0, 75, 0.55, 1.1),
+    "Быстрое, для нон-фикшн": (1.1, 0, 40, 0.2, 0.5),
 }
+DEFAULT_PRESET = "Выразительное, художественное"
 CUSTOM_PRESET = "Своё"
 F5_QUALITY = [(16, "Быстро (16 шагов)"), (32, "Обычно (32 шага)"), (64, "Максимум (64 шага, вдвое дольше)")]
 CHARS_PER_MINUTE = 900  # rough speaking rate for Russian prose
@@ -113,6 +117,7 @@ class MainWindow(QMainWindow):
         self._build_menu()
         self._build_tray()
         self._restore_settings()
+        self._connect_autosave()
         self._update_controls()
 
     # ------------------------------------------------------------------ UI construction
@@ -130,6 +135,9 @@ class MainWindow(QMainWindow):
         self.open_button.clicked.connect(self.open_book_dialog)
         self.chapter_list = QListWidget()
         self.chapter_list.currentRowChanged.connect(self._on_chapter_selected)
+        self.chapter_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.chapter_list.customContextMenuRequested.connect(self._chapter_menu)
+        self.chapter_list.setToolTip("Правый щелчок: отметить главы начиная с этой (например, пропустить предисловия)")
         sel_row = QHBoxLayout()
         all_btn, none_btn = QPushButton("Отметить все"), QPushButton("Снять все")
         all_btn.clicked.connect(lambda: self._check_all(True))
@@ -302,19 +310,45 @@ class MainWindow(QMainWindow):
         form.addRow("Текст образца:", self.ref_text_edit)
 
         self.preset_combo = QComboBox()
-        self.preset_combo.addItems([*STYLE_PRESETS, CUSTOM_PRESET])
-        self.preset_combo.setToolTip("Готовые сочетания скорости, высоты голоса, выразительности и пауз")
+        self.preset_combo.setToolTip(
+            "Готовые сочетания скорости, высоты голоса, выразительности и пауз.\n"
+            "Подобрали удачные значения — сохраните их кнопкой 💾, они останутся и после перезапуска."
+        )
         self.preset_combo.activated.connect(self._apply_preset)
-        form.addRow("Стиль чтения:", self.preset_combo)
+        self.user_presets: dict[str, list] = {}
+        save_preset = QToolButton()
+        save_preset.setText("💾")
+        save_preset.setToolTip("Сохранить текущие скорость, высоту, выразительность и паузы как свой стиль")
+        save_preset.clicked.connect(self._save_user_preset)
+        self.delete_preset_button = QToolButton()
+        self.delete_preset_button.setText("✕")
+        self.delete_preset_button.setToolTip("Удалить свой стиль")
+        self.delete_preset_button.clicked.connect(self._delete_user_preset)
+        self.preset_combo.currentTextChanged.connect(
+            lambda name: self.delete_preset_button.setEnabled(name in self.user_presets)
+        )
+        preset_row = QWidget()
+        pl = QHBoxLayout(preset_row)
+        pl.setContentsMargins(0, 0, 0, 0)
+        pl.addWidget(self.preset_combo, 1)
+        pl.addWidget(save_preset)
+        pl.addWidget(self.delete_preset_button)
+        self.preset_row = preset_row
+        self._fill_presets()
+        form.addRow("Стиль чтения:", preset_row)
 
         self.speed_spin = QDoubleSpinBox()
         self.speed_spin.setRange(0.5, 2.0)
         self.speed_spin.setSingleStep(0.05)
-        self.speed_spin.setValue(1.0)
+        self.speed_spin.setValue(0.9)
         self.speed_spin.setSuffix("×")
         form.addRow("Скорость:", self.speed_spin)
 
         self.pitch_slider, self.pitch_row = self._slider_row(-30, 30, lambda v: f"{v:+d}%" if v else "обычная")
+        self.pitch_row.setToolTip(
+            "Silero. Сильное понижение вместе с медленной скоростью (например −5% и 0,85×) может растягивать вдохи\n"
+            "и делать их «роботизированными». Если так — верните высоту ближе к нулю."
+        )
         form.addRow("Высота голоса:", self.pitch_row)
         self.expression_slider, self.expression_row = self._slider_row(0, 100, lambda v: f"{v}%")
         self.expression_slider.setValue(50)
@@ -345,6 +379,26 @@ class MainWindow(QMainWindow):
         )
         self.auto_stress_check.setChecked(stresser.available())
         form.addRow(self.auto_stress_check)
+        self.install_stress_button = QPushButton("Установить RUAccent (ударения нейросетью)")
+        self.install_stress_button.setToolTip("Скачает и установит пакет ruaccent прямо отсюда, без командной строки")
+        self.install_stress_button.clicked.connect(lambda: self.install_feature("ruaccent", "ударения нейросетью RUAccent"))
+        form.addRow(self.install_stress_button)
+
+        self.dialogue_check = QCheckBox("Диалоги — отдельными голосами (муж./жен.)")
+        self.dialogue_check.setToolTip(
+            "Реплики после тире («— Привет, — сказала она») читаются другим голосом: женские — женским,\n"
+            "мужские — мужским. Пол определяется по словам автора («сказала», «ответил», «она»), а для реплик\n"
+            "без них — по ходу разговора. Слова автора и остальной текст читает основной голос (рассказчик)."
+        )
+        self.dialogue_check.toggled.connect(self._update_dialogue_rows)
+        form.addRow(self.dialogue_check)
+        self.male_combo = QComboBox()
+        self.female_combo = QComboBox()
+        for combo in (self.male_combo, self.female_combo):
+            combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+            combo.setMinimumContentsLength(18)
+        form.addRow("Мужские реплики:", self.male_combo)
+        form.addRow("Женские реплики:", self.female_combo)
 
         self.sentence_pause = QDoubleSpinBox()
         self.sentence_pause.setRange(0.0, 3.0)
@@ -394,8 +448,52 @@ class MainWindow(QMainWindow):
         layout.addWidget(label)
         return slider, row
 
+    def _fill_presets(self) -> None:
+        try:
+            self.user_presets = json.loads(self.settings.value("style/user_presets", "{}") or "{}")
+        except ValueError:
+            self.user_presets = {}
+        current = self.preset_combo.currentText()
+        self.preset_combo.blockSignals(True)
+        self.preset_combo.clear()
+        self.preset_combo.addItems([*STYLE_PRESETS, *self.user_presets, CUSTOM_PRESET])
+        self.preset_combo.setCurrentText(current or DEFAULT_PRESET)
+        self.preset_combo.blockSignals(False)
+        self.delete_preset_button.setEnabled(self.preset_combo.currentText() in self.user_presets)
+
+    def _style_values(self) -> list:
+        return [round(self.speed_spin.value(), 2), self.pitch_slider.value(), self.expression_slider.value(),
+                round(self.sentence_pause.value(), 2), round(self.paragraph_pause.value(), 2)]
+
+    def _save_user_preset(self) -> None:
+        current = self.preset_combo.currentText()
+        suggestion = current if current in self.user_presets else "Мой стиль"
+        name, ok = QInputDialog.getText(self, "Свой стиль чтения", "Название:", text=suggestion)
+        name = name.strip()
+        if not ok or not name:
+            return
+        if name in STYLE_PRESETS or name == CUSTOM_PRESET:
+            QMessageBox.information(self, "Свой стиль", "Это название занято готовым стилем — выберите другое.")
+            return
+        self.user_presets[name] = self._style_values()
+        self.settings.setValue("style/user_presets", json.dumps(self.user_presets, ensure_ascii=False))
+        self._fill_presets()
+        self.preset_combo.setCurrentText(name)
+        self._save_settings()
+        self._log(f"Стиль «{name}» сохранён.")
+
+    def _delete_user_preset(self) -> None:
+        name = self.preset_combo.currentText()
+        if name not in self.user_presets:
+            return
+        del self.user_presets[name]
+        self.settings.setValue("style/user_presets", json.dumps(self.user_presets, ensure_ascii=False))
+        self._fill_presets()
+        self.preset_combo.setCurrentText(CUSTOM_PRESET)
+
     def _apply_preset(self, index: int) -> None:
-        values = STYLE_PRESETS.get(self.preset_combo.itemText(index))
+        name = self.preset_combo.itemText(index)
+        values = STYLE_PRESETS.get(name) or self.user_presets.get(name)
         if values is None:
             return
         speed, pitch, expressiveness, sentence_pause, paragraph_pause = values
@@ -445,16 +543,25 @@ class MainWindow(QMainWindow):
 
         self.per_chapter_radio = QRadioButton("Файл на каждую главу")
         self.single_radio = QRadioButton("Один файл на книгу")
-        self.per_chapter_radio.setChecked(True)
+        self.single_radio.setChecked(True)
         group = QButtonGroup(box)
         group.addButton(self.per_chapter_radio)
         group.addButton(self.single_radio)
+        self.single_radio.setToolTip(
+            "Удобнее для телефона: книга не перемешается с музыкой, плеер помнит место.\n"
+            "В файл записываются метки глав (MP3, OGG, Opus, FLAC) — по ним можно переходить в плеере."
+        )
+        self.per_chapter_radio.setToolTip("Удобно на компьютере: 001 - Глава первая.mp3, 002 - …")
         form.addRow(self.per_chapter_radio)
         form.addRow(self.single_radio)
 
         self.titles_check = QCheckBox("Зачитывать названия глав")
         self.titles_check.setChecked(True)
         form.addRow(self.titles_check)
+
+        self.chime_check = QCheckBox("Мелодия перед каждой главой")
+        self.chime_check.setToolTip("Короткий тихий звон — сразу слышно, что началась новая глава. Работает и при чтении вслух.")
+        form.addRow(self.chime_check)
 
         self.skip_check = QCheckBox("Пропускать уже готовые главы")
         self.skip_check.setToolTip("Если экспорт был прерван, повторный запуск продолжит с первой неготовой главы")
@@ -613,28 +720,32 @@ class MainWindow(QMainWindow):
         self._select_data(self.device_combo, s.value("device", "auto"))
         self._select_data(self.format_combo, s.value("format", "mp3"))
         self._select_data(self.bitrate_combo, int(s.value("bitrate", 128)))
-        self.speed_spin.setValue(float(s.value("speed", 1.0)))
-        self.sentence_pause.setValue(float(s.value("sentence_pause", 0.15)))
-        self.paragraph_pause.setValue(float(s.value("paragraph_pause", 0.5)))
+        speed, pitch, expressiveness, sentence_pause, paragraph_pause = STYLE_PRESETS[DEFAULT_PRESET]
+        self.speed_spin.setValue(float(s.value("speed", speed)))
+        self.sentence_pause.setValue(float(s.value("sentence_pause", sentence_pause)))
+        self.paragraph_pause.setValue(float(s.value("paragraph_pause", paragraph_pause)))
         self.numbers_check.setChecked(s.value("numbers", True, type=bool))
         self.auto_stress_check.setChecked(s.value("auto_stress", stresser.available(), type=bool))
         self.titles_check.setChecked(s.value("read_titles", True, type=bool))
         self.skip_check.setChecked(s.value("skip_existing", True, type=bool))
         self.tray_action.setChecked(self.tray is not None and s.value("tray_on_close", True, type=bool))
-        self.pitch_slider.setValue(int(s.value("style/pitch", 0)))
-        self.expression_slider.setValue(int(s.value("style/expressiveness", 50)))
+        self.pitch_slider.setValue(int(s.value("style/pitch", pitch)))
+        self.expression_slider.setValue(int(s.value("style/expressiveness", expressiveness)))
         self._select_data(self.quality_combo, int(s.value("style/quality", 32)))
-        self.preset_combo.setCurrentText(s.value("style/preset", next(iter(STYLE_PRESETS))))
+        self.preset_combo.setCurrentText(s.value("style/preset", DEFAULT_PRESET))
+        self.chime_check.setChecked(s.value("chime", False, type=bool))
+        self.dialogue_check.setChecked(s.value("dialogue/enabled", False, type=bool))
         self._set_theme(s.value("theme", DEFAULT_THEME))
         font = QFont()
         if s.value("editor_font") and font.fromString(s.value("editor_font")):
             self.editor.setFont(font)
         self.continue_check.setChecked(s.value("continue", True, type=bool))
-        (self.single_radio if s.value("single_file", False, type=bool) else self.per_chapter_radio).setChecked(True)
+        (self.single_radio if s.value("single_file", True, type=bool) else self.per_chapter_radio).setChecked(True)
         self.out_edit.setText(s.value("out_dir", self.out_edit.text()))
         self.ref_edit.setText(s.value("reference_wav", ""))
         self.ref_text_edit.setText(s.value("reference_text", ""))
         self._on_engine_changed()
+        self._restored = True
 
     def _save_settings(self) -> None:
         s = self.settings
@@ -665,7 +776,32 @@ class MainWindow(QMainWindow):
         s.setValue("out_dir", self.out_edit.text())
         s.setValue("reference_wav", self.ref_edit.text())
         s.setValue("reference_text", self.ref_text_edit.text())
+        s.setValue("chime", self.chime_check.isChecked())
+        s.setValue("dialogue/enabled", self.dialogue_check.isChecked())
         self._remember_voice()
+        s.sync()  # straight to disk: settings must survive a PC shutdown with the app still in the tray
+
+    def _connect_autosave(self) -> None:
+        """Every change is saved a moment later. Before, settings were only written when the window closed,
+        so after a reboot or a crash (the app sitting in the tray) everything was back to defaults."""
+        self._autosave = QTimer(self)
+        self._autosave.setSingleShot(True)
+        self._autosave.setInterval(700)
+        self._autosave.timeout.connect(self._save_settings)
+        schedule = lambda *_: self._autosave.start() if getattr(self, "_restored", False) else None  # noqa: E731
+        for combo in self.findChildren(QComboBox):
+            combo.currentIndexChanged.connect(schedule)
+        for spin in self.findChildren(QDoubleSpinBox):
+            spin.valueChanged.connect(schedule)
+        for slider in self.findChildren(QSlider):
+            slider.valueChanged.connect(schedule)
+        for button in (*self.findChildren(QCheckBox), *self.findChildren(QRadioButton)):
+            button.toggled.connect(schedule)
+        for edit in self.findChildren(QLineEdit):
+            if edit.parent() is not None and not isinstance(edit.parent(), QComboBox):
+                edit.editingFinished.connect(schedule)
+        self.voice_combo.editTextChanged.connect(schedule)
+        QApplication.instance().aboutToQuit.connect(self._save_settings)
 
     @staticmethod
     def _select_data(combo: QComboBox, value) -> None:
@@ -742,6 +878,25 @@ class MainWindow(QMainWindow):
         self._log(f"Открыта книга: {path.name} — {len(book.chapters)} глав")
         self._update_controls()
 
+    def _chapter_menu(self, pos) -> None:
+        row = self.chapter_list.indexAt(pos).row()
+        if row < 0:
+            return
+        count = self.chapter_list.count()
+        menu = QMenu(self)
+        menu.addAction("Отметить с этой главы до конца", lambda: self._check_range(row, count))
+        menu.addAction("Отметить только эту главу", lambda: self._check_range(row, row + 1))
+        menu.addAction("Отметить до этой главы включительно", lambda: self._check_range(0, row + 1))
+        menu.addSeparator()
+        menu.addAction("Отметить все", lambda: self._check_all(True))
+        menu.addAction("Снять все", lambda: self._check_all(False))
+        menu.exec(self.chapter_list.viewport().mapToGlobal(pos))
+
+    def _check_range(self, first: int, stop: int) -> None:
+        for i in range(self.chapter_list.count()):
+            state = Qt.CheckState.Checked if first <= i < stop else Qt.CheckState.Unchecked
+            self.chapter_list.item(i).setCheckState(state)
+
     def _check_all(self, checked: bool) -> None:
         state = Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked
         for i in range(self.chapter_list.count()):
@@ -798,7 +953,9 @@ class MainWindow(QMainWindow):
         if self._language() not in engine.languages:
             info += f"<br><b style='color:#c0392b'>Этот движок не поддерживает выбранный язык.</b>"
         self.engine_info.setText(info)
-        self.voice_form.setRowVisible(self.auto_stress_check, engine.stress_marks and not engine.builtin_stress)
+        stress_row = engine.stress_marks and not engine.builtin_stress
+        self.voice_form.setRowVisible(self.auto_stress_check, stress_row)
+        self.voice_form.setRowVisible(self.install_stress_button, not stresser.available())
         self.voice_form.setRowVisible(self.my_voices_row, engine.supports_cloning)
         self.voice_form.setRowVisible(self.random_row, isinstance(engine, SileroEngine))
         self.voice_form.setRowVisible(self.pitch_row, "pitch" in engine.style_controls)
@@ -849,6 +1006,35 @@ class MainWindow(QMainWindow):
             elif self.voice_combo.isEditable():
                 self.voice_combo.setEditText(saved)
         self.voice_combo.blockSignals(False)
+        self._refresh_dialogue_voices()
+
+    def _refresh_dialogue_voices(self) -> None:
+        engine = self._engine()
+        voices = [(v, label) for v, label in engine.voices(self._language()) if not str(v).endswith(":")]
+        for combo, gender, marker in ((self.male_combo, "male", "муж"), (self.female_combo, "female", "жен")):
+            current = combo.currentData()
+            combo.blockSignals(True)
+            combo.clear()
+            combo.addItem("Как у рассказчика", "")
+            for voice_id, label in voices:
+                combo.addItem(label, voice_id)
+            wanted = self.settings.value(f"dialogue/{engine.id}/{gender}") or current
+            index = combo.findData(wanted) if wanted else -1
+            if index < 0:  # first time: the first voice labelled «(муж.)» / «(жен.)»
+                index = next((i for i in range(combo.count()) if f"({marker}" in combo.itemText(i)), 0)
+            combo.setCurrentIndex(index)
+            combo.blockSignals(False)
+        self._update_dialogue_rows()
+
+    def _dialogue_available(self) -> bool:
+        return self._language() == "ru" and self.male_combo.count() > 1 and self._engine().id != "mms"
+
+    def _update_dialogue_rows(self, *_) -> None:
+        available = self._dialogue_available()
+        self.voice_form.setRowVisible(self.dialogue_check, available)
+        on = available and self.dialogue_check.isChecked()
+        self.voice_form.setRowVisible(self.male_combo, on)
+        self.voice_form.setRowVisible(self.female_combo, on)
 
     def _current_voice(self) -> str:
         text = self.voice_combo.currentText().strip()
@@ -861,6 +1047,9 @@ class MainWindow(QMainWindow):
         voice = self._current_voice()
         if voice:
             self.settings.setValue(f"voice/{self._engine().id}/{self._language()}", voice)
+        if self.male_combo.count():
+            self.settings.setValue(f"dialogue/{self._engine().id}/male", self.male_combo.currentData())
+            self.settings.setValue(f"dialogue/{self._engine().id}/female", self.female_combo.currentData())
 
     def _synth_settings(self) -> SynthSettings:
         return SynthSettings(
@@ -879,10 +1068,15 @@ class MainWindow(QMainWindow):
                 quality=self.quality_combo.currentData(),
             ),
             dictionary=self.dictionary,
+            dialogue_voices=self.dialogue_check.isChecked() and self._dialogue_available(),
+            male_voice=self.male_combo.currentData() or "",
+            female_voice=self.female_combo.currentData() or "",
         )
 
     def _prepare_engine(self, engine: TTSEngine, device: str, settings: SynthSettings, bridge: Bridge) -> None:
         self.engines.ensure_loaded(engine, device, settings.voice, bridge.log.emit)
+        if settings.dialogue_voices:
+            prepare_voices(engine, settings, bridge.log.emit)
         if needs_stresser(engine, settings) and stresser.available():
             stresser.load(bridge.log.emit)
 
@@ -974,10 +1168,11 @@ class MainWindow(QMainWindow):
         for w in (self.engine_combo, self.language_combo, self.voice_combo, self.device_combo, self.ref_row,
                   self.ref_text_edit, self.open_button, self.load_button, self.speed_spin, self.numbers_check,
                   self.sentence_pause, self.paragraph_pause, self.preset_combo, self.pitch_row,
-                  self.expression_row, self.quality_combo, self.random_row, self.my_voices_row):
+                  self.expression_row, self.quality_combo, self.random_row, self.my_voices_row, self.preset_row,
+                  self.dialogue_check, self.male_combo, self.female_combo, self.install_stress_button, self.chime_check):
             w.setEnabled(not busy)
         self.export_button.setEnabled(has_book and not busy)
-        self.cancel_button.setEnabled(self._busy in ("export", "load", "stress"))
+        self.cancel_button.setEnabled(self._busy in ("export", "load", "stress", "install"))
         self.read_button.setEnabled(has_book and self._busy in (None, "read"))
         self.stop_button.setEnabled(self._busy == "read")
         self.editor.setReadOnly(busy)
@@ -1052,12 +1247,14 @@ class MainWindow(QMainWindow):
             start, end = cursor.block().position(), len(text)
             self._read_mode = "chapter"
         settings = self._synth_settings()
+        chime = self.chime_check.isChecked() and self._read_mode == "chapter" and start == 0
         device = self.device_combo.currentData()
 
         def task(bridge: Bridge, cancel: threading.Event):
             self._prepare_engine(engine, device, settings, bridge)
             chunks = make_chunks(engine, text, settings, start, end)
-            reader = ReadAloud(engine, settings, chunks, bridge.chunk.emit, bridge.log.emit)
+            intro = chapter_chime(engine.sample_rate) if chime else None
+            reader = ReadAloud(engine, settings, chunks, bridge.chunk.emit, bridge.log.emit, intro)
             self._reader = reader
             if cancel.is_set():  # stop was pressed while the model was loading
                 return False
@@ -1103,6 +1300,39 @@ class MainWindow(QMainWindow):
         self.editor.centerCursor()
         self._update_controls()
 
+    # ------------------------------------------------------------------ optional packages
+
+    def install_feature(self, module: str, what: str, then: Callable[[], None] | None = None) -> None:
+        """Ask, then install a missing optional package in the background (no console needed)."""
+        if self._busy:
+            return
+        requirements = PACKAGES[module]
+        answer = QMessageBox.question(
+            self, "Нужно установить пакет",
+            f"Для функции «{what}» нужен пакет {', '.join(requirements)}. Он не установлен.\n\n"
+            "Установить сейчас? Нужен интернет; ход установки виден в журнале внизу окна.",
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        self.progress.setFormat("Установка…")
+
+        def task(bridge: Bridge, cancel: threading.Event):
+            install(requirements, bridge.log.emit, cancel.is_set)
+
+        def done(_result, error) -> None:
+            self.progress.setFormat("")
+            if error:
+                self._show_error("Не удалось установить", error)
+                return
+            if module == "ruaccent":
+                self.auto_stress_check.setChecked(True)
+            self._on_engine_changed()
+            QMessageBox.information(self, "Готово", f"Установлено. Функция «{what}» готова к работе.")
+            if then is not None:
+                then()
+
+        self._run_task("install", task, done)
+
     # ------------------------------------------------------------------ export
 
     def start_export(self) -> None:
@@ -1127,6 +1357,7 @@ class MainWindow(QMainWindow):
             single_file=self.single_radio.isChecked(),
             read_titles=self.titles_check.isChecked(),
             skip_existing=self.skip_check.isChecked(),
+            chime=self.chime_check.isChecked(),
         )
         settings = self._synth_settings()
         device = self.device_combo.currentData()
@@ -1197,7 +1428,7 @@ class MainWindow(QMainWindow):
         if self._busy or not self.book:
             return
         if not stresser.available():
-            QMessageBox.warning(self, "Нет RUAccent", "Установите пакет ruaccent:\nuv sync --extra stress")
+            self.install_feature("ruaccent", "ударения нейросетью RUAccent")
             return
         start, end = self._editor_range()
         source = self.editor.toPlainText()[start:end]
@@ -1405,6 +1636,8 @@ class MainWindow(QMainWindow):
             self.open_book(mime.text().strip().splitlines()[0])
 
     def closeEvent(self, event) -> None:
+        # Closing to the tray is still a user close action; keep the latest controls.
+        self._save_settings()
         if self.tray is not None and self.tray_action.isChecked() and not self._quitting:
             event.ignore()
             self.hide()

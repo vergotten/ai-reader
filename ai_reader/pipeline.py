@@ -5,13 +5,14 @@ from __future__ import annotations
 import queue
 import re
 import threading
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Callable
 
 import numpy as np
 
-from .audio import AudioWriter, silence, write_tags
+from .audio import AudioWriter, chapter_chime, silence, trim_silence, write_chapters, write_tags
+from .dialogue import SPEECH, segment
 from .books import Book
 from .stress import PronunciationDictionary, strip_stress, stresser
 from .text import Chunk, chunk_text, is_speakable, normalize
@@ -38,23 +39,39 @@ class SynthSettings:
     auto_stress: bool = False  # run RUAccent for engines that read "+" but don't stress text themselves (Silero)
     style: Style = field(default_factory=Style)
     dictionary: PronunciationDictionary | None = None
+    # dialogue lines read by other voices of the same engine ("" = the narrator's voice)
+    dialogue_voices: bool = False
+    male_voice: str = ""
+    female_voice: str = ""
+    trim: bool = True  # cut the engine's own silence at chunk edges so the pauses above are exact
+
+    def all_voices(self) -> list[str]:
+        voices = [self.voice]
+        if self.dialogue_voices:
+            voices += [v for v in (self.male_voice, self.female_voice) if v and v not in voices]
+        return voices
+
+    def voice_for(self, gender: str | None) -> str:
+        if gender == "f" and self.female_voice:
+            return self.female_voice
+        return self.male_voice or self.voice
 
 
 def needs_stresser(engine: TTSEngine, s: SynthSettings) -> bool:
-    return s.language == "ru" and (engine.builtin_stress or _stress_in_pipeline(engine, s))
+    return s.language == "ru" and (engine.builtin_stress or any(_stress_in_pipeline(engine, s, v) for v in s.all_voices()))
 
 
-def _stress_in_pipeline(engine: TTSEngine, s: SynthSettings) -> bool:
-    wanted = s.auto_stress or engine.requires_stress(s.voice)
+def _stress_in_pipeline(engine: TTSEngine, s: SynthSettings, voice: str | None = None) -> bool:
+    wanted = s.auto_stress or engine.requires_stress(voice or s.voice)
     return s.language == "ru" and engine.stress_marks and wanted and not engine.builtin_stress
 
 
-def prepare_text(engine: TTSEngine, text: str, s: SynthSettings) -> str:
-    """Book text -> what the engine is given: user dictionary, numbers as words, stress marks."""
+def prepare_text(engine: TTSEngine, text: str, s: SynthSettings, voice: str | None = None) -> str:
+    """Book text -> what the engine is given: user dictionary, numbers as words, Latin words, stress marks."""
     if s.dictionary is not None:
         text = s.dictionary.apply(text)
     text = normalize(text, s.language, s.expand_numbers)
-    if _stress_in_pipeline(engine, s):
+    if _stress_in_pipeline(engine, s, voice):
         text = stresser.process(text)
     if not engine.stress_marks:
         text = strip_stress(text)
@@ -62,17 +79,47 @@ def prepare_text(engine: TTSEngine, text: str, s: SynthSettings) -> str:
 
 
 def make_chunks(engine: TTSEngine, text: str, s: SynthSettings, start: int = 0, end: int | None = None) -> list[Chunk]:
-    # leave headroom: number expansion makes text longer
+    # leave headroom: number expansion and Latin transliteration make text longer
     max_chars = max(60, int(engine.max_chars * 0.85))
-    return chunk_text(text, max_chars, s.sentence_pause, s.paragraph_pause, start, end)
+    min_chars = engine.min_chunk_chars
+    if not (s.dialogue_voices and s.language == "ru" and len(s.all_voices()) > 1):
+        return chunk_text(text, max_chars, s.sentence_pause, s.paragraph_pause, start, end, min_chars)
+
+    chunks: list[Chunk] = []
+    segments = segment(text, start, end)
+    for i, seg in enumerate(segments):
+        pieces = chunk_text(text, max_chars, s.sentence_pause, s.paragraph_pause, seg.start, seg.end, min_chars)
+        if not pieces:
+            continue
+        line_goes_on = i + 1 < len(segments) and "\n" not in text[seg.end : segments[i + 1].start]
+        if line_goes_on:  # speech -> «сказала она» in the same paragraph: a short breath, not a paragraph pause
+            last = pieces[-1]
+            pieces[-1] = replace(last, pause=min(s.sentence_pause, 0.25) if last.text.rstrip().endswith(",") else s.sentence_pause)
+        if seg.role == SPEECH:
+            voice = s.voice_for(seg.gender)
+            pieces = [replace(c, voice=voice) if voice != s.voice else c for c in pieces]
+        chunks.extend(pieces)
+    return chunks
 
 
 def synth_chunk(engine: TTSEngine, chunk: Chunk, s: SynthSettings) -> np.ndarray | None:
-    text = prepare_text(engine, chunk.text, s)
+    voice = chunk.voice or s.voice
+    text = prepare_text(engine, chunk.text, s, voice)
     if not is_speakable(text):
         return None
-    audio = engine.synthesize(text, s.voice, s.speed, s.language, s.speaker_wav, s.speaker_text, s.style)
+    if s.dialogue_voices:
+        # several voices: make sure this one's model is the active one (a no-op when it already is)
+        engine.prepare(voice, lambda _m: None)
+    audio = engine.synthesize(text, voice, s.speed, s.language, s.speaker_wav, s.speaker_text, s.style)
+    if s.trim:
+        audio = trim_silence(audio, engine.sample_rate)
     return audio if audio.size else None
+
+
+def prepare_voices(engine: TTSEngine, s: SynthSettings, log: Log) -> None:
+    """Download/load whatever the extra dialogue voices need before reading starts; the narrator goes last."""
+    for voice in reversed(s.all_voices()):
+        engine.prepare(voice, log)
 
 
 def safe_filename(name: str, limit: int = 80) -> str:
@@ -93,6 +140,7 @@ class ExportJob:
     single_file: bool = False
     read_titles: bool = True
     chapter_pause: float = 1.5
+    chime: bool = False  # a short soft bell before each chapter, so a new chapter is heard at once
     skip_existing: bool = False  # per-chapter export: keep chapter files that are already there
 
 
@@ -119,6 +167,8 @@ def run_export(
     sr = engine.sample_rate
     files: list[Path] = []
     writer: AudioWriter | None = None
+    marks: list[tuple[str, float]] = []  # chapter markers of a one-file book: (title, start in seconds)
+    chime = chapter_chime(sr) if job.chime else None
 
     def open_writer(path: Path) -> AudioWriter:
         log(f"Запись: {path.name}")
@@ -145,6 +195,10 @@ def run_export(
                     progress(done, total, ch.title)
                     continue
                 writer = open_writer(target)
+            if job.single_file:
+                marks.append((ch.title, writer.duration))
+            if chime is not None:
+                writer.write(chime)
             for chunk in chunks:
                 if cancelled():
                     raise Cancelled
@@ -165,8 +219,12 @@ def run_export(
                 files.append(finish(writer, ch.title, book.author, book.title, n, len(plan)))
                 writer = None
         if job.single_file and writer is not None:
-            files.append(finish(writer, book.title, book.author, book.title))
+            total_seconds = writer.duration
+            path = finish(writer, book.title, book.author, book.title)
             writer = None
+            if len(marks) > 1 and write_chapters(path, marks, total_seconds):
+                log(f"В файл записаны метки глав: {len(marks)} — в плеере можно переходить по главам.")
+            files.append(path)
     except BaseException:
         if writer is not None:
             writer.close()
@@ -199,7 +257,9 @@ class ReadAloud:
         chunks: list[Chunk],
         on_chunk: Callable[[int, int], None],
         log: Log,
+        intro: np.ndarray | None = None,
     ) -> None:
+        self.intro = intro
         self.engine = engine
         self.settings = settings
         self.chunks = chunks
@@ -261,6 +321,8 @@ class ReadAloud:
         block = sr // 10
         stream = _open_output(sd, sr)
         stream.start()
+        if self.intro is not None and self.intro.size:
+            stream.write(self.intro.reshape(-1, 1).astype(np.float32))
         try:
             while not self._stop.is_set():
                 try:

@@ -21,6 +21,7 @@ class XTTSEngine(TTSEngine):
     supports_cloning = True
     style_controls = ("expressiveness",)
     max_chars = 180  # XTTS limit for Russian is ~182 characters per call
+    min_chunk_chars = 25
     requirements = ("TTS", "torch")
     extra = "xtts"
     license_notice = (
