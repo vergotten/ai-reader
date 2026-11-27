@@ -21,6 +21,30 @@ from pathlib import Path
 from ..paths import voices_dir
 
 LIB_PREFIX = "lib:"
+DEFAULT_VOICE = "vovan"  # the fine-tuned voice shipped with the full installer; F5-TTS reads with it by default
+
+
+def bundled_voices_dir() -> Path:
+    """Voices shipped with the app: <app>/voices, filled by the installer (absent in the lite build)."""
+    return Path(__file__).resolve().parents[2] / "voices"
+
+
+def install_bundled_voices(source: Path | None = None, target: Path | None = None) -> list[str]:
+    """Copy the shipped voices into the user's library once. A voice the user already has is left alone,
+    so retraining it, or editing its clips, survives app updates. Returns the ids copied now."""
+    source = source or bundled_voices_dir()
+    target = target or voices_dir()
+    copied = []
+    if not source.is_dir():
+        return copied
+    for d in sorted(source.iterdir()):
+        if (d / "voice.json").is_file() and not (target / d.name).exists():
+            tmp = target / (d.name + ".part")
+            shutil.rmtree(tmp, ignore_errors=True)
+            shutil.copytree(d, tmp)
+            tmp.rename(target / d.name)  # a half-copied voice never looks like a real one
+            copied.append(d.name)
+    return copied
 DEFAULT_BASE_MODEL = "misha24-v2"
 
 _TRANSLIT = dict(

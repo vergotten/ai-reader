@@ -64,3 +64,21 @@ def test_truncated_checkpoint_is_dropped(tmp_path):
     (bad / "model_last.pt").write_bytes((good / "model_last.pt").read_bytes()[:500])
     drop_broken_checkpoint(bad)
     assert not (bad / "model_last.pt").exists()
+
+
+def test_bundled_voice_is_copied_once(tmp_path):
+    from ai_reader.voices.library import install_bundled_voices
+
+    shipped = tmp_path / "app" / "voices" / "vovan"
+    shipped.mkdir(parents=True)
+    (shipped / "voice.json").write_text('{"id": "vovan", "name": "Вован"}', encoding="utf-8")
+    (shipped / "model.pt").write_bytes(b"shipped")
+    library = tmp_path / "library"
+    library.mkdir()
+
+    assert install_bundled_voices(shipped.parent, library) == ["vovan"]
+    assert (library / "vovan" / "model.pt").read_bytes() == b"shipped"
+
+    (library / "vovan" / "model.pt").write_bytes(b"retrained by the user")
+    assert install_bundled_voices(shipped.parent, library) == []
+    assert (library / "vovan" / "model.pt").read_bytes() == b"retrained by the user"

@@ -5,6 +5,11 @@
 #ifndef ModelsDir
   #define ModelsDir "..\models"
 #endif
+; voices shipped with the full build (build.ps1 copies them from the voice library); the app adds them to the
+; user's library on first start
+#ifndef VoicesDir
+  #define VoicesDir "..\build\voices-pack"
+#endif
 ; /DLite: Silero-only build with CPU PyTorch, small enough for one well-compressed .exe
 #ifdef Lite
   #define Suffix "-Lite"
@@ -59,6 +64,9 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 Source: "..\build\stage\python\*"; DestDir: "{app}\python"; Flags: recursesubdirs createallsubdirs ignoreversion
 Source: "..\ai_reader\*"; DestDir: "{app}\ai_reader"; Excludes: "__pycache__\*,*.pyc"; Flags: recursesubdirs createallsubdirs ignoreversion
 Source: "{#ModelsDir}\*"; DestDir: "{app}\models"; Excludes: "xet\*,.locks\*,\torch\hub\checkpoints\*"; Flags: recursesubdirs createallsubdirs ignoreversion skipifsourcedoesntexist
+#ifndef Lite
+Source: "{#VoicesDir}\*"; DestDir: "{app}\voices"; Flags: recursesubdirs createallsubdirs ignoreversion skipifsourcedoesntexist
+#endif
 Source: "launch.pyw"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\README.md"; DestDir: "{app}"; Flags: ignoreversion
 
@@ -77,9 +85,11 @@ Type: filesandordirs; Name: "{app}\ai_reader"
 Type: filesandordirs; Name: "{app}\models\huggingface\hub"
 Type: filesandordirs; Name: "{app}\models\torch\hub\checkpoints"
 Type: filesandordirs; Name: "{app}\models\tts"
+Type: filesandordirs; Name: "{app}\voices"
 
 [UninstallDelete]
 ; files created after installation: models downloaded later, Python caches
 Type: filesandordirs; Name: "{app}\models"
 Type: filesandordirs; Name: "{app}\ai_reader"
 Type: filesandordirs; Name: "{app}\python"
+Type: filesandordirs; Name: "{app}\voices"
