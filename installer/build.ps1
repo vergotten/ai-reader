@@ -10,6 +10,7 @@ Builds the Windows installer into dist\. Run on Windows (not WSL), from PowerShe
 -Max     full build only: the smallest installer. F5-TTS weights go in fp16 and everything is compressed with the
          strongest LZMA2 as one solid stream. Takes a few hours and several GB of free memory.
 -Models  full build only: what is downloaded into models\ first; whatever is in models\ is packed.
+-Voices  full build only: ids of fine-tuned voices from %LOCALAPPDATA%\ai-reader\voices to ship (default: vovan).
 Needs uv (https://docs.astral.sh/uv/). Inno Setup 6 is downloaded and installed if it is missing.
 #>
 param(
@@ -17,7 +18,8 @@ param(
     [switch]$PackOnly,
     [switch]$Max,
     [ValidateSet("all", "none")] [string]$Models = "all",
-    [string]$Extras = "all"
+    [string]$Extras = "all",
+    [string[]]$Voices = @("vovan")
 )
 $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot
@@ -122,6 +124,23 @@ if (-not $Lite) {
     if ($Max) { $slimArgs += "--fp16" }
     Invoke-Checked "Preparing the models for the installer" { & (Join-Path $root ".venv\Scripts\python.exe") @slimArgs }
     $modelsDir = $packModels
+}
+
+if (-not $Lite) {
+    # fine-tuned voices: the model, the reference clip and the clips, without the multi-GB training checkpoints
+    $voicesPack = Join-Path $root "build\voices-pack"
+    if (Test-Path $voicesPack) { Remove-Item $voicesPack -Recurse -Force }
+    foreach ($id in $Voices) {
+        $src = Join-Path $env:LOCALAPPDATA "ai-reader\voices\$id"
+        if (-not (Test-Path (Join-Path $src "model.pt"))) {
+            Write-Warning "Voice '$id' is not fine-tuned yet (no $src\model.pt): not shipped"
+            continue
+        }
+        robocopy $src (Join-Path $voicesPack $id) /E /XD train /NFL /NDL /NJH /NJS /NP | Out-Null
+        if ($LASTEXITCODE -ge 8) { throw "Copying voice '$id' failed (robocopy exit $LASTEXITCODE)" }
+        $global:LASTEXITCODE = 0  # robocopy returns 1 for "files copied"
+        Write-Host "== Voice '$id' goes into the installer"
+    }
 }
 
 if (-not $PackOnly) {

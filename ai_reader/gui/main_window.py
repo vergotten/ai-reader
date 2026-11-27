@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 import threading
 import time
 import traceback
@@ -72,6 +73,7 @@ from ..tts.base import Style
 from ..tts.silero import RANDOM_PREFIX, SileroEngine
 from ..voices import is_library_voice
 from ..voices.audio_io import AUDIO_FILTER, collect_audio
+from ..voices.library import DEFAULT_VOICE, LIB_PREFIX
 from ..winpath import to_local_path, windows_drives
 from .auto_stress import BookStresser
 from .dictionary_dialog import DictionaryDialog
@@ -79,7 +81,7 @@ from .theme import DEFAULT_THEME, THEMES, apply_theme
 from .voices_dialog import VoicesDialog, dropped_audio
 
 LANGUAGES = [("ru", "Русский"), ("en", "English")]
-SETTINGS_VERSION = 3  # 2: melody, music, dialogue voices and RUAccent on by default; 3: warm light theme
+SETTINGS_VERSION = 4  # 2: melody, music, dialogue voices, RUAccent on; 3: warm light theme; 4: F5-TTS + Вован
 DEVICES = [("auto", "Авто (GPU, если есть)"), ("cuda", "GPU (CUDA)"), ("cpu", "CPU")]
 # reading style -> (speed, pitch %, expressiveness %, pause between phrases, pause between paragraphs)
 # pauses now follow every sentence (not every ~500 characters), so these are what you actually hear
@@ -791,7 +793,18 @@ class MainWindow(QMainWindow):
                 s.remove("engine")
         if version < 3 and s.value("ui_theme") == "midnight":  # the previous default, not a choice
             s.remove("ui_theme")
+        if version < 4:  # the shipped fine-tuned voice is the new default
+            s.remove("engine")
+            for language in ("ru", "en"):
+                s.remove(f"voice/f5/{language}")
         s.setValue("settings_version", SETTINGS_VERSION)
+
+    def _default_engine(self) -> str:
+        """F5-TTS (the best quality; reads as the shipped Вован) whenever there is an NVIDIA card for it.
+        Silero only without one, or without the F5-TTS packages (lite build): F5-TTS on a CPU is far too slow."""
+        if shutil.which("nvidia-smi") and not self.engines.get("f5").missing_requirements():
+            return "f5"
+        return "silero"
 
     def _restore_settings(self) -> None:
         self._upgrade_settings()
@@ -803,7 +816,7 @@ class MainWindow(QMainWindow):
         if state is not None:
             self.vsplit.restoreState(state)
         self.log_action.setChecked(s.value("window/log", True, type=bool))
-        self._select_data(self.engine_combo, s.value("engine", "silero"))
+        self._select_data(self.engine_combo, s.value("engine", self._default_engine()))
         self._select_data(self.language_combo, s.value("language", "ru"))
         self._select_data(self.device_combo, s.value("device", "auto"))
         self._select_data(self.format_combo, s.value("format", "mp3"))
@@ -1127,6 +1140,8 @@ class MainWindow(QMainWindow):
         for voice_id, label in engine.voices(self._language()):
             self.voice_combo.addItem(label, voice_id)
         saved = self.settings.value(f"voice/{engine.id}/{self._language()}")
+        if not saved and engine.id == "f5":
+            saved = LIB_PREFIX + DEFAULT_VOICE
         if saved:
             idx = self.voice_combo.findData(saved)
             if idx >= 0:

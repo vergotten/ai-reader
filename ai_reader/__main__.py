@@ -22,6 +22,13 @@ def main() -> None:
 
     use_models_dir()  # before anything imports huggingface_hub / torch
 
+    from ai_reader.voices.library import install_bundled_voices
+
+    try:
+        install_bundled_voices()
+    except OSError:
+        logging.exception("Could not copy the voices shipped with the app")
+
     from pathlib import Path
 
     from PySide6.QtGui import QIcon
