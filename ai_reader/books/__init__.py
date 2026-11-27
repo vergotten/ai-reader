@@ -49,4 +49,4 @@ def load_book(path: str | Path) -> Book:
     return book
 
 
-__all__ = ["Book", "Chapter", "FILE_FILTER", "load_book"]
+__all__ = ["FILE_FILTER", "Book", "Chapter", "load_book"]

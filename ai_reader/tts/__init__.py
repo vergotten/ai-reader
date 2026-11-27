@@ -2,12 +2,10 @@ from __future__ import annotations
 
 from .base import Log, TTSEngine, free_torch_memory
 from .f5 import F5Engine
-from .mms import MMSEngine
-from .piper import PiperEngine
 from .silero import SileroEngine
-from .xtts import XTTSEngine
 
-ENGINE_CLASSES: list[type[TTSEngine]] = [SileroEngine, PiperEngine, XTTSEngine, F5Engine, MMSEngine]
+# both read '+' stress marks: Silero is the light one (fast, no GPU needed), F5-TTS clones and learns voices
+ENGINE_CLASSES: list[type[TTSEngine]] = [SileroEngine, F5Engine]
 
 
 class EngineManager:

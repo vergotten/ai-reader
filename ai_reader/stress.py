@@ -11,9 +11,9 @@ import json
 import os
 import re
 import threading
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable
 
 from .paths import dictionary_path
 
@@ -37,7 +37,11 @@ def has_stress(text: str) -> bool:
 
 
 class Stresser:
-    """Thread-safe, lazily loaded RUAccent. One instance is shared by every engine (it takes ~0.5 GB)."""
+    """Thread-safe, lazily loaded RUAccent. One instance is shared by every engine.
+
+    turbo3.1 resolved homographs best of the RUAccent models in our tests (better than big_poetry). Its big word
+    dictionary is left out: it cost 0.6 GB of memory and 2.5 s of loading and changed nothing in the results.
+    """
 
     MODEL_SIZE = "turbo3.1"
 
@@ -62,11 +66,12 @@ class Stresser:
             from huggingface_hub import constants
             from ruaccent import RUAccent
 
-            log("RUAccent: загрузка модели ударений (первый раз скачивается ~0,5 ГБ)…")
-            accentizer = RUAccent()
             workdir = os.path.join(constants.HF_HOME, "ruaccent")
             os.makedirs(workdir, exist_ok=True)
-            accentizer.load(omograph_model_size=self.MODEL_SIZE, use_dictionary=True, workdir=workdir)
+            note = "" if os.listdir(workdir) else " (скачивается ~0,5 ГБ, один раз)"
+            log(f"RUAccent: загрузка модели ударений{note}…")
+            accentizer = RUAccent()
+            accentizer.load(omograph_model_size=self.MODEL_SIZE, use_dictionary=False, workdir=workdir)
             self._accentizer = accentizer
             log("RUAccent загружен.")
 

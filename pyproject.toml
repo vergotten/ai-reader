@@ -19,22 +19,18 @@ dependencies = [
     "huggingface_hub",
 ]
 
-# torch < 2.9: from 2.9 coqui-tts needs torchcodec, which on Windows needs separately installed FFmpeg DLLs
+# torch < 2.9: from 2.9 torchaudio needs torchcodec, which on Windows needs separately installed FFmpeg DLLs
 [project.optional-dependencies]
 # RUAccent: neural stress marks (used by Silero, F5-TTS, the editor's «Расставить ударения» and voice training)
 stress = ["ruaccent"]
 silero = ["torch>=2.4,<2.9", "torchaudio>=2.4,<2.9", "omegaconf", "ruaccent"]
-piper = ["piper-tts>=1.2"]
-mms = ["torch>=2.4,<2.9", "transformers", "uroman"]
-# coqui-tts 0.27 imports helpers that transformers 5 removed
-xtts = ["torch>=2.4,<2.9", "torchaudio>=2.4,<2.9", "coqui-tts", "transformers>=4.52,<5"]
 # f5-tts 1.1.10+ requires torchcodec (same Windows FFmpeg problem as torch 2.9); 1.1.9 is the last release without it
 f5 = ["torch>=2.4,<2.9", "torchaudio>=2.4,<2.9", "f5-tts==1.1.9", "ruaccent", "transformers>=4.52,<5"]
 # building your own voice: Whisper transcription + F5-TTS fine-tuning; av decodes M4A/AAC/AMR voice messages
 train = ["ai-reader[f5]", "av"]
 # optional 8-bit Adam for fine-tuning on GPUs with little memory
 bnb = ["bitsandbytes>=0.45"]
-all = ["ai-reader[silero,piper,mms,xtts,f5,train]"]
+all = ["ai-reader[silero,f5,train]"]
 
 [dependency-groups]
 dev = ["pytest>=8", "ruff"]

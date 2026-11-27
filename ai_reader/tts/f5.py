@@ -3,15 +3,56 @@ from __future__ import annotations
 import os
 import re
 import warnings
+from pathlib import Path
 
 import numpy as np
 
+from ..paths import download_note, models_dir
 from ..stress import stresser
+from ..voices.dataset import ASR_MODEL
 from ..voices.library import LIB_PREFIX, VoiceLibrary
 from .base import Log, TTSEngine
 
 SAMPLE_RATE = 24_000
 _ENDS_WITH_PUNCT = re.compile(r"[.!?…]$")
+
+
+def base_checkpoint(model_id: str, log: Log = lambda _m: None) -> tuple[str, str]:
+    """(checkpoint, vocab) files of a base model, downloading them if needed.
+
+    f5_tts opens .pt checkpoints only in torch's safe mode, which can't read ESpeech's file. So a .pt is turned
+    once into fp16 EMA weights in safetensors (models/f5/<id>.safetensors, a quarter of the size: ESpeech
+    ships two fp32 copies of the weights) and the original is removed from the download cache.
+    """
+    from huggingface_hub import hf_hub_download
+
+    repo, ckpt, vocab, label = F5Engine.MODELS[model_id]
+    vocab_path = hf_hub_download(repo, vocab)
+    if not ckpt.endswith(".pt"):
+        return hf_hub_download(repo, ckpt), vocab_path
+    converted = models_dir() / "f5" / f"{model_id}.safetensors"
+    if not converted.is_file():
+        log(f"F5-TTS: «{label}» готовится к работе (один раз: перевод в компактный формат)…")
+        source = Path(hf_hub_download(repo, ckpt))
+        convert_checkpoint(source, converted)
+        for path in {source, source.resolve()}:  # the cache entry and the file it points to
+            path.unlink(missing_ok=True)
+    return str(converted), vocab_path
+
+
+def convert_checkpoint(source: Path, target: Path) -> None:
+    """EMA weights of an F5-TTS .pt checkpoint as fp16 safetensors (the form f5_tts loads with use_ema)."""
+    import torch
+    from safetensors.torch import save_file
+
+    # torch's full unpickler: the file is from the model's official repository (see F5Engine.MODELS)
+    checkpoint = torch.load(source, map_location="cpu", weights_only=False)
+    ema = checkpoint.get("ema_model_state_dict", checkpoint)
+    weights = {k: (v.half() if torch.is_floating_point(v) else v).contiguous() for k, v in ema.items()}
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp = target.with_suffix(".tmp")
+    save_file(weights, str(tmp))
+    os.replace(tmp, target)
 
 
 class F5Engine(TTSEngine):
@@ -56,7 +97,7 @@ class F5Engine(TTSEngine):
             "ESpeech-TTS-1 RL-V2 (Apache 2.0)",
         ),
     }
-    MODEL_CFG = dict(dim=1024, depth=22, heads=16, ff_mult=2, text_dim=512, conv_layers=4)  # F5TTS_v1_Base
+    MODEL_CFG = {"dim": 1024, "depth": 22, "heads": 16, "ff_mult": 2, "text_dim": 512, "conv_layers": 4}  # F5TTS_v1_Base
     MAX_REFERENCE_SECONDS = 15.0
     AUTO_TRIM_SECONDS = 12.0  # an untranscribed reference is cut to this length before Whisper hears it
 
@@ -108,14 +149,13 @@ class F5Engine(TTSEngine):
             if base_id not in self.MODELS:
                 raise RuntimeError(f"Неизвестная модель F5-TTS: {voice}")
             from f5_tts.model import DiT
-            from huggingface_hub import hf_hub_download
 
-            repo, ckpt, vocab, label = self.MODELS[base_id]
+            repo, _ckpt, _vocab, label = self.MODELS[base_id]
             self._model = None
             self._model_id = None
-            log(f"F5-TTS: загрузка «{label}» с Hugging Face…")
-            ckpt_path = own_ckpt or hf_hub_download(repo, ckpt)
-            vocab_path = hf_hub_download(repo, vocab)
+            log(f"F5-TTS: загрузка «{label}»{download_note(repo, '1–2,5 ГБ')}…")
+            base_path, vocab_path = base_checkpoint(base_id, log)
+            ckpt_path = own_ckpt or base_path
             if own_ckpt:
                 log(f"F5-TTS: дообученный голос {own_ckpt}")
             self._model = self._infer.load_model(DiT, self.MODEL_CFG, ckpt_path, vocab_file=vocab_path, device=self.device)
@@ -167,7 +207,7 @@ class F5Engine(TTSEngine):
         return ref
 
     def _transcribe(self, audio: np.ndarray) -> str:
-        self._log("F5-TTS: текст образца не задан — распознаю его Whisper (первый раз скачивается ~1,6 ГБ)…")
+        self._log(f"F5-TTS: текст образца не задан — распознаю его Whisper{download_note(ASR_MODEL, '~1,6 ГБ')}…")
         infer = self._infer
         infer.initialize_asr_pipeline(device=self.device)
         try:

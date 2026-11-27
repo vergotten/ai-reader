@@ -26,7 +26,7 @@ DEFAULT_BASE_MODEL = "misha24-v2"
 _TRANSLIT = dict(
     zip(
         "абвгдеёжзийклмнопрстуфхцчшщъыьэюя",
-        "a b v g d e e zh z i y k l m n o p r s t u f h ts ch sh sch _ y _ e yu ya".split(),
+        ["a", "b", "v", "g", "d", "e", "e", "zh", "z", "i", "y", "k", "l", "m", "n", "o", "p", "r", "s", "t", "u", "f", "h", "ts", "ch", "sh", "sch", "_", "y", "_", "e", "yu", "ya"],
         strict=True,
     )
 )
@@ -100,17 +100,6 @@ class Voice:
         clips = self.enabled_clips() if enabled_only else self.clips
         return sum(c.duration for c in clips)
 
-    def xtts_references(self, max_seconds: float = 30.0) -> list[str]:
-        """Several clean clips for XTTS conditioning, the reference first."""
-        refs, total = [], 0.0
-        ordered = sorted(self.enabled_clips(), key=lambda c: (c.file != self.reference, -c.duration))
-        for c in ordered:
-            if total >= max_seconds:
-                break
-            refs.append(str(self.path(c.file)))
-            total += c.duration
-        return refs
-
     def label(self) -> str:
         kind = "дообучен" if self.is_trained else "клон по образцу"
         return f"★ {self.name} ({kind})"
@@ -126,7 +115,7 @@ class Voice:
         _write_json(self.dir / "clips.json", [asdict(c) for c in self.clips])
 
     @classmethod
-    def load(cls, directory: Path) -> "Voice":
+    def load(cls, directory: Path) -> Voice:
         meta = json.loads((directory / "voice.json").read_text(encoding="utf-8"))
         known = {f for f in cls.__dataclass_fields__ if f not in ("dir", "clips")}
         voice = cls(dir=directory, **{k: v for k, v in meta.items() if k in known})
@@ -172,8 +161,7 @@ class VoiceLibrary:
         return sorted(voices, key=lambda v: v.created)
 
     def get(self, voice_id: str) -> Voice | None:
-        if voice_id.startswith(LIB_PREFIX):
-            voice_id = voice_id[len(LIB_PREFIX):]
+        voice_id = voice_id.removeprefix(LIB_PREFIX)
         d = self.root / voice_id
         if (d / "voice.json").is_file():
             return Voice.load(d)

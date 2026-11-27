@@ -1,19 +1,22 @@
 <#
 Builds the Windows installer into dist\. Run on Windows (not WSL), from PowerShell or via build-installer*.bat:
 
-    powershell -ExecutionPolicy Bypass -File installer\build.ps1 [-Lite] [-Models base|clone|all|none] [-Extras all]
+    powershell -ExecutionPolicy Bypass -File installer\build.ps1 [-Lite] [-Max] [-Models all|none] [-Extras all]
 
 -Lite    small installer for slow connections (~0.5 GB): Silero only, CPU build of PyTorch, one .exe.
          Without it: every engine and CUDA PyTorch (4-10 GB, .exe plus .bin parts).
 -PackOnly  skip the preparation and only run Inno Setup on what the previous run left in build\ (pass -Lite again
            if that run was a lite one).
+-Max     full build only: the smallest installer. F5-TTS weights go in fp16 and everything is compressed with the
+         strongest LZMA2 as one solid stream. Takes a few hours and several GB of free memory.
 -Models  full build only: what is downloaded into models\ first; whatever is in models\ is packed.
 Needs uv (https://docs.astral.sh/uv/). Inno Setup 6 is downloaded and installed if it is missing.
 #>
 param(
     [switch]$Lite,
     [switch]$PackOnly,
-    [ValidateSet("base", "clone", "all", "none")] [string]$Models = "base",
+    [switch]$Max,
+    [ValidateSet("all", "none")] [string]$Models = "all",
     [string]$Extras = "all"
 )
 $ErrorActionPreference = "Stop"
@@ -112,6 +115,15 @@ if ($PackOnly) {
     }
 }
 
+if (-not $Lite) {
+    # every model once (the download cache keeps each file twice), F5-TTS in fp16 with -Max
+    $packModels = Join-Path $root "build\models-pack"
+    $slimArgs = @("installer\slim_models.py", $modelsDir, $packModels)
+    if ($Max) { $slimArgs += "--fp16" }
+    Invoke-Checked "Preparing the models for the installer" { & (Join-Path $root ".venv\Scripts\python.exe") @slimArgs }
+    $modelsDir = $packModels
+}
+
 if (-not $PackOnly) {
 # The venv's base interpreter is a self-contained Python from uv: it can be copied to another PC as is.
 $homeLine = Get-Content (Join-Path $venv "pyvenv.cfg") | Where-Object { $_ -match '^home\s*=' } | Select-Object -First 1
@@ -141,6 +153,10 @@ if (-not $iscc) {
 
 $defines = @("/DAppVersion=$version", "/DModelsDir=$modelsDir")
 if ($Lite) { $defines += "/DLite" }
+elseif ($Max) { $defines += "/DMax"; Write-Host "== Maximum compression: this takes a few hours" }
+# a smaller build makes fewer .bin parts; stale ones from the previous build would get sent along by mistake
+$old = if ($Lite) { "AI-Reader-Setup-*-Lite.exe" } else { "AI-Reader-Setup-$version.exe", "AI-Reader-Setup-$version-*.bin" }
+Get-ChildItem dist\* -Include $old -File -ErrorAction SilentlyContinue | Remove-Item -Force
 Invoke-Checked "Building the installer (takes a while)" { & $iscc @defines installer\ai-reader.iss }
 Write-Host ""
 Write-Host "Done. Send ALL files from dist\ that belong to this build (the .exe and, for the full build, every .bin):"

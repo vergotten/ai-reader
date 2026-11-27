@@ -4,8 +4,8 @@ import gc
 import importlib.util
 import threading
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Callable
 
 import numpy as np
 
@@ -45,7 +45,7 @@ class Style:
     """How to speak. Each engine uses the controls it lists in `style_controls` and ignores the rest."""
 
     pitch: int = 0  # percent, about -30…+30 (Silero)
-    expressiveness: float = 0.5  # 0 = even and stable, 1 = lively but less predictable (Piper, XTTS)
+    expressiveness: float = 0.5  # 0 = even and stable, 1 = lively but less predictable
     quality: int = 32  # diffusion steps: more = cleaner and slower (F5-TTS)
 
 

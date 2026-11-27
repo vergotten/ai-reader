@@ -49,20 +49,51 @@ def trim_silence(audio: np.ndarray, sample_rate: int, threshold_db: float = -42.
     return out
 
 
-def chapter_chime(sample_rate: int, volume: float = 0.18) -> np.ndarray:
-    """A short soft two-note bell (≈1.6 s with its tail) that marks the start of a chapter. Made on the fly:
-    no sound files to ship, and it is quiet enough not to startle someone listening at night."""
-    def bell(freq: float, seconds: float) -> np.ndarray:
-        t = np.arange(int(seconds * sample_rate), dtype=np.float32) / sample_rate
-        tone = sum(a * np.sin(2 * np.pi * freq * k * t) for k, a in ((1, 1.0), (2.0, 0.35), (3.01, 0.12), (4.2, 0.05)))
-        attack = np.minimum(1.0, t / 0.008)
-        return (tone * attack * np.exp(-t * 3.2)).astype(np.float32)
+# The chapter tune: the same short phrase before every chapter, like the signature tune of an audiobook series.
+# (beat, MIDI note, length in beats) — D major, a rising phrase that settles on the tonic.
+_MELODY = (
+    (0.0, 74, 1.0), (1.0, 78, 0.5), (1.5, 81, 0.5), (2.0, 86, 1.5), (3.5, 85, 0.5),
+    (4.0, 81, 1.0), (5.0, 83, 0.5), (5.5, 81, 0.5), (6.0, 78, 1.0), (7.0, 74, 2.0),
+)
+_MELODY_CHORDS = ((0.0, (50, 57, 62, 66)), (4.0, (47, 55, 59, 62)), (6.0, (45, 52, 57, 61)), (7.0, (50, 57, 62, 66)))
+_MELODY_BEAT = 0.36  # seconds: an unhurried tempo
 
-    first, second = bell(659.25, 1.3), bell(987.77, 1.3)  # E5 -> B5, a calm rising fifth
-    offset = int(0.28 * sample_rate)
-    out = np.zeros(offset + len(second) + int(0.35 * sample_rate), dtype=np.float32)
-    out[: len(first)] += first
-    out[offset : offset + len(second)] += 0.8 * second
+
+def _midi(note: int) -> float:
+    return 440.0 * 2 ** ((note - 69) / 12)
+
+
+def chapter_melody(sample_rate: int, volume: float = 0.3) -> np.ndarray:
+    """The chapter tune (≈4.5 s): a soft music-box phrase over warm chords, always the same, so a new chapter is
+    recognised at once. Synthesized here: no sound files to ship, quiet enough for listening at night."""
+    beat = _MELODY_BEAT
+    total = 9.0 * beat + 1.8
+    out = np.zeros(int(total * sample_rate), dtype=np.float32)
+
+    def place(start: float, sound: np.ndarray) -> None:
+        i = int(start * sample_rate)
+        n = min(len(sound), len(out) - i)
+        out[i : i + n] += sound[:n]
+
+    for at, note, length in _MELODY:  # music box: bright attack, ringing decay
+        seconds = length * beat + 1.2
+        t = np.arange(int(seconds * sample_rate), dtype=np.float32) / sample_rate
+        f = _midi(note)
+        tone = np.sin(2 * np.pi * f * t) + 0.3 * np.sin(2 * np.pi * 2 * f * t) + 0.08 * np.sin(2 * np.pi * 3.01 * f * t)
+        place(at * beat, 0.5 * tone * np.minimum(1.0, t / 0.004) * np.exp(-t * 2.6))
+
+    for k, (at, notes) in enumerate(_MELODY_CHORDS):  # soft pad chords under the tune
+        end = _MELODY_CHORDS[k + 1][0] if k + 1 < len(_MELODY_CHORDS) else 9.0
+        seconds = (end - at) * beat + (1.6 if k + 1 == len(_MELODY_CHORDS) else 0.25)
+        t = np.arange(int(seconds * sample_rate), dtype=np.float32) / sample_rate
+        pad = sum(np.sin(2 * np.pi * _midi(n) * t) + 0.15 * np.sin(2 * np.pi * 2 * _midi(n) * t) for n in notes)
+        envelope = np.minimum(1.0, t / 0.25) * np.clip((seconds - t) / 0.6, 0.0, 1.0)
+        place(at * beat, 0.09 * pad * envelope)
+
+    delay = int(0.27 * sample_rate)  # a little room around the music box
+    out[delay:] += 0.25 * out[:-delay].copy()
+    fade = int(0.4 * sample_rate)
+    out[-fade:] *= np.linspace(1.0, 0.0, fade, dtype=np.float32)
     return (out / (np.max(np.abs(out)) + 1e-9) * volume).astype(np.float32)
 
 
@@ -130,7 +161,7 @@ class AudioWriter:
             self._sf.close()
             self._sf = None
 
-    def __enter__(self) -> "AudioWriter":
+    def __enter__(self) -> AudioWriter:
         return self
 
     def __exit__(self, *exc) -> None:
@@ -162,7 +193,7 @@ def write_tags(path: Path, title: str, artist: str = "", album: str = "", track:
 
 
 def _timestamp(seconds: float) -> str:
-    ms = int(round(seconds * 1000))
+    ms = round(seconds * 1000)
     h, rest = divmod(ms, 3_600_000)
     m, rest = divmod(rest, 60_000)
     sec, ms = divmod(rest, 1000)

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import itertools
 import re
 from pathlib import Path
 
@@ -81,7 +82,7 @@ def text_to_book(text: str, title: str) -> Book:
             if intro:
                 chapters.append(Chapter("Начало", intro))
         bounds = heads + [len(lines)]
-        for start, end in zip(bounds, bounds[1:]):
+        for start, end in itertools.pairwise(bounds):
             chapters.append(Chapter(lines[start].strip(), join_paragraphs(_paragraphs(lines[start + 1 : end]))))
     else:
         chapters.extend(split_long("Текст", join_paragraphs(_paragraphs(lines)), max_chars=30_000))

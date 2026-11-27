@@ -31,13 +31,12 @@ def models_dir() -> Path:
 def use_models_dir() -> Path:
     """Point every model cache at models_dir(). Call before huggingface_hub, torch or TTS are imported.
 
-    Hugging Face (Piper, MMS, F5-TTS, Whisper, RUAccent, XTTS weights) -> models/huggingface,
-    Silero (torch.hub) -> models/torch, coqui XTTS -> models/tts. Caches the user set explicitly win.
+    Hugging Face (F5-TTS, Whisper, RUAccent) -> models/huggingface,
+    Silero (torch.hub) -> models/torch. Caches the user set explicitly win.
     """
     root = models_dir()
     os.environ.setdefault("HF_HOME", str(root / "huggingface"))
     os.environ.setdefault("TORCH_HOME", str(root / "torch"))
-    os.environ.setdefault("TTS_HOME", str(root / "tts"))
     return root
 
 
@@ -56,3 +55,18 @@ def silero_voices_dir() -> Path:
 
 def dictionary_path() -> Path:
     return data_dir() / "pronunciation.json"
+
+
+def hf_cached(repo: str) -> bool:
+    """True when a Hugging Face model repo is already in the local cache (nothing to download)."""
+    from huggingface_hub import scan_cache_dir
+
+    try:
+        return any(r.repo_id == repo and r.size_on_disk > 0 for r in scan_cache_dir().repos)
+    except Exception:
+        return False
+
+
+def download_note(repo: str, size: str) -> str:
+    """For a log line: tells that a model will be downloaded, but only when it really isn't on disk yet."""
+    return "" if hf_cached(repo) else f", скачивается {size}"
