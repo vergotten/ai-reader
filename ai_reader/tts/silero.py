@@ -9,7 +9,7 @@ from xml.sax.saxutils import escape
 import numpy as np
 
 from ..paths import models_dir, silero_voices_dir
-from .base import Log, Style, TTSEngine, to_numpy
+from .base import Log, Style, TTSEngine, resolve_device, to_numpy
 
 DEFAULT_MODEL = "v4_ru"
 CIS_MODEL = "v5_cis_base"
@@ -54,7 +54,7 @@ class SileroEngine(TTSEngine):
     name = "Silero TTS — русский (v4 и v5)"
     description = (
         "Лучшее качество для русского: автоматически ставит ударения и букву «ё», быстро работает даже на CPU. "
-        "Модели (~40–100 МБ каждая) скачиваются с GitHub snakers4/silero-models: v4, более новая v5 и "
+        "Модели (snakers4/silero-models, ~40–100 МБ каждая): v4, более новая v5 и "
         "v5 CIS (десятки голосов с разными акцентами, для неё ударения расставляет RUAccent). "
         "Кнопка «🎲» создаёт новый случайный голос. Высота голоса и скорость настраиваются в «Стиле речи». "
         "Ударение вручную — «+» перед гласной: «з+амок». Лицензия v4/v5 — CC BY-NC-SA (некоммерческая), CIS — MIT."
@@ -123,6 +123,10 @@ class SileroEngine(TTSEngine):
 
     # ------------------------------------------------------------------ loading
 
+    def target_device(self, preference: str) -> str:
+        """«Авто» means the CPU here: Silero is fast enough on it, and staying off CUDA saves ~1 GB of memory."""
+        return "cpu" if preference == "auto" else resolve_device(preference)
+
     def _load(self, device: str, log: Log) -> None:
         import torch  # noqa: F401 — fail early if missing; the model itself is loaded per voice in prepare()
 
@@ -141,7 +145,9 @@ class SileroEngine(TTSEngine):
 
         self._model = None
         self._model_id = None
-        log(f"Silero: загрузка модели {model_id} через torch.hub (в первый раз скачивается)…")
+        cached = Path(torch.hub.get_dir()) / "snakers4_silero-models_master" / "src" / "silero" / "model" / f"{model_id}.pt"
+        note = "" if cached.is_file() else " (скачивается один раз, 40–150 МБ)"
+        log(f"Silero: загрузка модели {model_id}{note}…")
         model, _ = torch.hub.load(
             "snakers4/silero-models", "silero_tts", language="ru", speaker=model_id, trust_repo=True
         )
@@ -173,7 +179,7 @@ class SileroEngine(TTSEngine):
             return np.zeros(0, dtype=np.float32)
         if not speaker:
             speaker = next((sid for sid, _label in self._cached_speakers(model_id)), "")
-        kwargs: dict = dict(speaker=speaker, sample_rate=self.sample_rate)
+        kwargs: dict = {"speaker": speaker, "sample_rate": self.sample_rate}
         if voice_path:
             if not Path(voice_path).is_file():
                 raise RuntimeError("Файл случайного голоса удалён — выберите другой голос")

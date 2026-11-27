@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from ai_reader.audio import chapter_chime, trim_silence
+from ai_reader.audio import chapter_melody, trim_silence
 from ai_reader.books.model import Book, Chapter
 from ai_reader.dialogue import NARRATOR, SPEECH, segment
 from ai_reader.latin import transliterate
@@ -99,10 +99,14 @@ def test_single_file_export_with_chapter_marks(tmp_path):
     import mutagen
 
     book = Book(title="Книга", author="Автор", chapters=[Chapter("Глава 1", "Раз. Два."), Chapter("Глава 2", "Три.")])
-    job = ExportJob(book, [0, 1], tmp_path, fmt="mp3", single_file=True, chime=True)
+    job = ExportJob(book, [0, 1], tmp_path, fmt="mp3", single_file=True, melody=True)
     logs = []
-    files = run_export(job, _engine(), SynthSettings(voice="m"), lambda *a: None, logs.append, lambda: False)
+    settings = SynthSettings(voice="m", music=True)
+    files = run_export(job, _engine(), settings, lambda *a: None, logs.append, lambda: False)
     assert len(files) == 1 and files[0].stat().st_size > 0
     tags = mutagen.File(files[0])
     assert any(k.startswith("CHAP") for k in tags.tags)
-    assert len(chapter_chime(24000)) > 24000
+    melody = chapter_melody(24000)
+    assert 3 * 24000 < len(melody) < 7 * 24000 and abs(melody).max() <= 0.31
+    assert (chapter_melody(24000) == melody).all()  # the same tune before every chapter
+    assert any(line.startswith("Настроение текста") for line in logs)

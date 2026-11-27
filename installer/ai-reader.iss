@@ -22,9 +22,9 @@ PrivilegesRequired=lowest
 DefaultDirName={localappdata}\Programs\AI Reader
 DefaultGroupName=AI Reader
 DisableProgramGroupPage=yes
-; "x64" rather than "x64compatible": also understood by Inno Setup older than 6.3
-ArchitecturesAllowed=x64
-ArchitecturesInstallIn64BitMode=x64
+; 64-bit Windows only (needs Inno Setup 6.3+; build.ps1 installs a newer one when missing)
+ArchitecturesAllowed=x64compatible
+ArchitecturesInstallIn64BitMode=x64compatible
 OutputDir=..\dist
 OutputBaseFilename=AI-Reader-Setup-{#AppVersion}{#Suffix}
 SetupIconFile=..\ai_reader\icon.ico
@@ -33,6 +33,14 @@ WizardStyle=modern
 #ifdef Lite
 Compression=lzma2/max
 SolidCompression=yes
+#elif defined(Max)
+; /DMax: the smallest full installer — strongest LZMA2 over everything as one solid stream. Takes hours;
+; two compression threads keep the memory it needs at a few GB
+Compression=lzma2/ultra64
+SolidCompression=yes
+LZMAUseSeparateProcess=yes
+LZMANumBlockThreads=2
+DiskSpanning=yes
 #else
 ; several GB of PyTorch and models: fast compression, split into 2 GB .bin files next to the .exe
 Compression=lzma2/fast
@@ -61,6 +69,14 @@ Name: "{userdesktop}\AI Reader"; Filename: "{app}\python\pythonw.exe"; Parameter
 
 [Run]
 Filename: "{app}\python\pythonw.exe"; Parameters: """{app}\launch.pyw"""; WorkingDir: "{app}"; Description: "{cm:LaunchProgram,AI Reader}"; Flags: nowait postinstall skipifsilent
+
+[InstallDelete]
+; an update replaces the program and the models completely: old download-cache duplicates and models of
+; removed engines (Piper, MMS, XTTS) go, the new set is installed below
+Type: filesandordirs; Name: "{app}\ai_reader"
+Type: filesandordirs; Name: "{app}\models\huggingface\hub"
+Type: filesandordirs; Name: "{app}\models\torch\hub\checkpoints"
+Type: filesandordirs; Name: "{app}\models\tts"
 
 [UninstallDelete]
 ; files created after installation: models downloaded later, Python caches

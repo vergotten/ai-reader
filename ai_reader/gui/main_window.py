@@ -4,11 +4,20 @@ import json
 import threading
 import time
 import traceback
+from collections.abc import Callable
 from pathlib import Path
-from typing import Callable
 
 from PySide6.QtCore import QObject, QSettings, Qt, QTimer, QUrl, Signal
-from PySide6.QtGui import QAction, QActionGroup, QDesktopServices, QFont, QKeySequence, QPalette, QTextCharFormat, QTextCursor
+from PySide6.QtGui import (
+    QAction,
+    QActionGroup,
+    QDesktopServices,
+    QFont,
+    QKeySequence,
+    QPalette,
+    QTextCharFormat,
+    QTextCursor,
+)
 from PySide6.QtWidgets import (
     QApplication,
     QButtonGroup,
@@ -43,22 +52,34 @@ from PySide6.QtWidgets import (
 )
 
 from .. import __version__
-from ..audio import BITRATES, FORMATS, chapter_chime
+from ..ambient import music_dir
+from ..audio import BITRATES, FORMATS
 from ..books import FILE_FILTER, Book, load_book
 from ..installer import PACKAGES, install
-from ..pipeline import Cancelled, ExportJob, ReadAloud, SynthSettings, make_chunks, needs_stresser, prepare_voices, run_export
-from ..stress import PronunciationDictionary, strip_stress, stresser
+from ..pipeline import (
+    Cancelled,
+    ExportJob,
+    ReadAloud,
+    SynthSettings,
+    make_chunks,
+    needs_stresser,
+    prepare_voices,
+    run_export,
+)
+from ..stress import PronunciationDictionary, stresser, strip_stress
 from ..tts import EngineManager, TTSEngine
 from ..tts.base import Style
 from ..tts.silero import RANDOM_PREFIX, SileroEngine
-from ..voices.audio_io import AUDIO_EXTENSIONS, AUDIO_FILTER
 from ..voices import is_library_voice
+from ..voices.audio_io import AUDIO_FILTER, collect_audio
 from ..winpath import to_local_path, windows_drives
+from .auto_stress import BookStresser
 from .dictionary_dialog import DictionaryDialog
 from .theme import DEFAULT_THEME, THEMES, apply_theme
-from .voices_dialog import VoicesDialog
+from .voices_dialog import VoicesDialog, dropped_audio
 
-LANGUAGES = [("ru", "Русский"), ("uk", "Українська"), ("en", "English")]
+LANGUAGES = [("ru", "Русский"), ("en", "English")]
+SETTINGS_VERSION = 3  # 2: melody, music, dialogue voices and RUAccent on by default; 3: warm light theme
 DEVICES = [("auto", "Авто (GPU, если есть)"), ("cuda", "GPU (CUDA)"), ("cpu", "CPU")]
 # reading style -> (speed, pitch %, expressiveness %, pause between phrases, pause between paragraphs)
 # pauses now follow every sentence (not every ~500 characters), so these are what you actually hear
@@ -109,6 +130,14 @@ class MainWindow(QMainWindow):
         self.tray: QSystemTrayIcon | None = None
         self._applying_preset = False
         self._theme_actions: dict[str, QAction] = {}
+        self.book_stresser = BookStresser()
+        self.book_stresser.log.connect(self._log)
+        self.book_stresser.chapter_done.connect(self._on_chapter_stressed)
+        self.book_stresser.progress.connect(
+            lambda done, total: self.statusBar().showMessage(f"Ударения в книге: {done} из {total} глав", 4000)
+        )
+        self.book_stresser.failed.connect(lambda error: self._log(f"Ударения во всей книге не расставлены: {error}"))
+        self.book_stresser.finished.connect(lambda: self._log("Ударения расставлены во всей книге."))
 
         self.setWindowTitle("AI Reader")
         self.resize(1400, 860)
@@ -132,6 +161,7 @@ class MainWindow(QMainWindow):
         self.book_label = QLabel("Откройте книгу: TXT, FB2, EPUB, PDF, HTML\n(или перетащите файл в окно)")
         self.book_label.setWordWrap(True)
         self.open_button = QPushButton("Открыть книгу…")
+        self.open_button.setProperty("primary", True)  # accent colour in the ✦ themes
         self.open_button.clicked.connect(self.open_book_dialog)
         self.chapter_list = QListWidget()
         self.chapter_list.currentRowChanged.connect(self._on_chapter_selected)
@@ -184,9 +214,16 @@ class MainWindow(QMainWindow):
         for b in (self.stress_button, self.unstress_button, self.to_dict_button, dict_button):
             tools.addWidget(b)
         tools.addStretch(1)
+        self.book_stress_check = QCheckBox("Ударения во всей книге сразу")
+        self.book_stress_check.setToolTip(
+            "Сразу после открытия книги RUAccent расставляет «+» во всех главах (в фоне, начиная с открытой главы).\n"
+            "Ударения видны в тексте — спорные можно поправить до озвучки. Главы, которые вы уже правили, не трогаются."
+        )
+        self.book_stress_check.toggled.connect(self._on_book_stress_toggled)
+        tools.addWidget(self.book_stress_check)
         hint = QLabel(
             "Подсказка: чтение начинается с абзаца под курсором или с выделенного фрагмента. "
-            "Ударение — «+» перед гласной («з+амок»); его понимают Silero и F5-TTS, остальные движки знак пропускают."
+            "Ударение — «+» перед гласной («з+амок»), его понимают оба движка."
         )
         hint.setWordWrap(True)
         hint.setStyleSheet("color: gray;")
@@ -275,10 +312,13 @@ class MainWindow(QMainWindow):
 
         from_recording = QPushButton("＋ Голос из записи…")
         from_recording.setToolTip(
-            "Выберите голосовое сообщение или другую запись речи — программа сама сделает из неё голос.\n"
-            "Можно и просто перетащить запись в окно."
+            "Выберите голосовые сообщения или папку с записями речи — программа сама сделает из них голос.\n"
+            "Можно и просто перетащить записи или папку в окно."
         )
-        from_recording.clicked.connect(lambda: self.new_voice_from_recording())
+        recording_menu = QMenu(from_recording)
+        recording_menu.addAction("Выбрать файлы…", lambda: self.new_voice_from_recording())
+        recording_menu.addAction("Вся папка с записями…", lambda: self.new_voice_from_recording(folder=True))
+        from_recording.setMenu(recording_menu)
         my_voices = QPushButton("Мои голоса и дообучение…")
         my_voices.setToolTip("Проверить записи и тексты, дообучить F5-TTS на своём голосе")
         my_voices.clicked.connect(self.open_voices)
@@ -353,8 +393,7 @@ class MainWindow(QMainWindow):
         self.expression_slider, self.expression_row = self._slider_row(0, 100, lambda v: f"{v}%")
         self.expression_slider.setValue(50)
         self.expression_row.setToolTip(
-            "Меньше — ровнее и стабильнее, больше — живее интонации, но выше риск оговорок.\n"
-            "Piper: шум генератора, XTTS-v2: температура."
+            "Меньше — ровнее и стабильнее, больше — живее интонации, но выше риск оговорок."
         )
         form.addRow("Выразительность:", self.expression_row)
         self.quality_combo = QComboBox()
@@ -514,6 +553,7 @@ class MainWindow(QMainWindow):
         v = QVBoxLayout(box)
         row = QHBoxLayout()
         self.read_button = QPushButton("▶ Читать (F5)")
+        self.read_button.setProperty("primary", True)  # accent colour in the ✦ themes
         self.read_button.clicked.connect(self.toggle_reading)
         self.stop_button = QPushButton("■ Стоп (F6)")
         self.stop_button.clicked.connect(self.stop_reading)
@@ -559,9 +599,41 @@ class MainWindow(QMainWindow):
         self.titles_check.setChecked(True)
         form.addRow(self.titles_check)
 
-        self.chime_check = QCheckBox("Мелодия перед каждой главой")
-        self.chime_check.setToolTip("Короткий тихий звон — сразу слышно, что началась новая глава. Работает и при чтении вслух.")
-        form.addRow(self.chime_check)
+        self.melody_check = QCheckBox("Мелодия перед каждой главой")
+        self.melody_check.setToolTip(
+            "Одна и та же короткая мелодия (≈4 с) перед каждой главой, потом название главы и текст —\n"
+            "как в профессиональных аудиокнигах. Работает и при чтении вслух."
+        )
+        form.addRow(self.melody_check)
+
+        self.music_check = QCheckBox("Фоновая музыка по настроению текста")
+        self.music_check.setToolTip(
+            "Тихий эмбиент под чтение. Программа угадывает настроение каждой части главы по словам —\n"
+            "спокойное, светлое, грустное, напряжённое, загадочное или нежное — и подбирает музыку.\n"
+            "Пока звучит голос, музыка тише, в паузах чуть громче. Перед главой — несколько секунд музыки,\n"
+            "в конце главы она плавно затихает. Работает и при чтении вслух, и при экспорте."
+        )
+        form.addRow(self.music_check)
+        music_row = QWidget()
+        mr = QHBoxLayout(music_row)
+        mr.setContentsMargins(0, 0, 0, 0)
+        self.music_volume = QSlider(Qt.Orientation.Horizontal)
+        self.music_volume.setRange(5, 100)
+        self.music_volume.setValue(50)
+        self.music_volume.setToolTip("Громкость фоновой музыки (50 — тихо, под голосом её почти не слышно)")
+        self.music_volume_label = QLabel("50")
+        self.music_volume_label.setMinimumWidth(24)
+        self.music_volume.valueChanged.connect(lambda v: self.music_volume_label.setText(str(v)))
+        own_music = QPushButton("Своя музыка…")
+        own_music.setToolTip("Открыть папку, куда можно положить свою музыку для каждого настроения")
+        own_music.clicked.connect(self._open_music_dir)
+        mr.addWidget(self.music_volume, 1)
+        mr.addWidget(self.music_volume_label)
+        mr.addWidget(own_music)
+        self.music_row = music_row
+        form.addRow("Громкость музыки:", music_row)
+        self.music_check.toggled.connect(music_row.setEnabled)
+        music_row.setEnabled(False)
 
         self.skip_check = QCheckBox("Пропускать уже готовые главы")
         self.skip_check.setToolTip("Если экспорт был прерван, повторный запуск продолжит с первой неготовой главы")
@@ -581,6 +653,7 @@ class MainWindow(QMainWindow):
 
         btn_row = QHBoxLayout()
         self.export_button = QPushButton("Экспортировать отмеченные главы")
+        self.export_button.setProperty("primary", True)  # accent colour in the ✦ themes
         self.export_button.clicked.connect(self.start_export)
         self.cancel_button = QPushButton("Отмена")
         self.cancel_button.clicked.connect(self.cancel_task)
@@ -662,6 +735,7 @@ class MainWindow(QMainWindow):
         recording_action = QAction("Новый голос из записи…", self)
         recording_action.triggered.connect(lambda: self.new_voice_from_recording())
         voices_menu.addAction(recording_action)
+        voices_menu.addAction("Новый голос из папки с записями…", lambda: self.new_voice_from_recording(folder=True))
         voices_menu.addAction(voices_action)
         voices_menu.addAction(dict_action)
 
@@ -706,7 +780,21 @@ class MainWindow(QMainWindow):
 
     # ------------------------------------------------------------------ settings
 
+    def _upgrade_settings(self) -> None:
+        """Settings saved by older versions: switch on once what is now on by default (the user can turn it off)."""
+        s = self.settings
+        version = int(s.value("settings_version", 1))
+        if version < 2:
+            for key in ("chime", "melody", "music", "dialogue/enabled", "auto_stress"):
+                s.remove(key)
+            if s.value("engine") in ("piper", "mms", "xtts"):  # engines that were removed
+                s.remove("engine")
+        if version < 3 and s.value("ui_theme") == "midnight":  # the previous default, not a choice
+            s.remove("ui_theme")
+        s.setValue("settings_version", SETTINGS_VERSION)
+
     def _restore_settings(self) -> None:
+        self._upgrade_settings()
         s = self.settings
         geometry = s.value("window/geometry")
         if geometry is not None:
@@ -725,7 +813,7 @@ class MainWindow(QMainWindow):
         self.sentence_pause.setValue(float(s.value("sentence_pause", sentence_pause)))
         self.paragraph_pause.setValue(float(s.value("paragraph_pause", paragraph_pause)))
         self.numbers_check.setChecked(s.value("numbers", True, type=bool))
-        self.auto_stress_check.setChecked(s.value("auto_stress", stresser.available(), type=bool))
+        self.auto_stress_check.setChecked(s.value("auto_stress", True, type=bool) and stresser.available())
         self.titles_check.setChecked(s.value("read_titles", True, type=bool))
         self.skip_check.setChecked(s.value("skip_existing", True, type=bool))
         self.tray_action.setChecked(self.tray is not None and s.value("tray_on_close", True, type=bool))
@@ -733,9 +821,12 @@ class MainWindow(QMainWindow):
         self.expression_slider.setValue(int(s.value("style/expressiveness", expressiveness)))
         self._select_data(self.quality_combo, int(s.value("style/quality", 32)))
         self.preset_combo.setCurrentText(s.value("style/preset", DEFAULT_PRESET))
-        self.chime_check.setChecked(s.value("chime", False, type=bool))
-        self.dialogue_check.setChecked(s.value("dialogue/enabled", False, type=bool))
-        self._set_theme(s.value("theme", DEFAULT_THEME))
+        self.melody_check.setChecked(s.value("melody", True, type=bool))
+        self.music_check.setChecked(s.value("music", True, type=bool))
+        self.music_volume.setValue(int(s.value("music_volume", 50)))
+        self.dialogue_check.setChecked(s.value("dialogue/enabled", True, type=bool))
+        self.book_stress_check.setChecked(s.value("book_stress", True, type=bool))
+        self._set_theme(s.value("ui_theme", DEFAULT_THEME))
         font = QFont()
         if s.value("editor_font") and font.fromString(s.value("editor_font")):
             self.editor.setFont(font)
@@ -762,6 +853,7 @@ class MainWindow(QMainWindow):
         s.setValue("paragraph_pause", self.paragraph_pause.value())
         s.setValue("numbers", self.numbers_check.isChecked())
         s.setValue("auto_stress", self.auto_stress_check.isChecked())
+        s.setValue("book_stress", self.book_stress_check.isChecked())
         s.setValue("read_titles", self.titles_check.isChecked())
         s.setValue("skip_existing", self.skip_check.isChecked())
         if self.tray is not None:
@@ -776,7 +868,9 @@ class MainWindow(QMainWindow):
         s.setValue("out_dir", self.out_edit.text())
         s.setValue("reference_wav", self.ref_edit.text())
         s.setValue("reference_text", self.ref_text_edit.text())
-        s.setValue("chime", self.chime_check.isChecked())
+        s.setValue("melody", self.melody_check.isChecked())
+        s.setValue("music", self.music_check.isChecked())
+        s.setValue("music_volume", self.music_volume.value())
         s.setValue("dialogue/enabled", self.dialogue_check.isChecked())
         self._remember_voice()
         s.sync()  # straight to disk: settings must survive a PC shutdown with the app still in the tray
@@ -788,7 +882,10 @@ class MainWindow(QMainWindow):
         self._autosave.setSingleShot(True)
         self._autosave.setInterval(700)
         self._autosave.timeout.connect(self._save_settings)
-        schedule = lambda *_: self._autosave.start() if getattr(self, "_restored", False) else None  # noqa: E731
+        def schedule(*_) -> None:
+            if getattr(self, "_restored", False):
+                self._autosave.start()
+
         for combo in self.findChildren(QComboBox):
             combo.currentIndexChanged.connect(schedule)
         for spin in self.findChildren(QDoubleSpinBox):
@@ -877,6 +974,38 @@ class MainWindow(QMainWindow):
         self.chapter_list.setCurrentRow(0)
         self._log(f"Открыта книга: {path.name} — {len(book.chapters)} глав")
         self._update_controls()
+        self._stress_book()
+
+    # ------------------------------------------------------------------ stress marks for the whole book
+
+    def _stress_book(self) -> None:
+        self.book_stresser.cancel()
+        if self.book and self.book_stress_check.isChecked() and stresser.available() and self._language() == "ru":
+            self._commit_editor()
+            self._log("Расстановка ударений во всей книге (в фоне, сначала открытая глава)…")
+            self.book_stresser.start(self.book, max(self.current_index, 0))
+
+    def _on_book_stress_toggled(self, checked: bool) -> None:
+        if checked:
+            self._stress_book()
+        else:
+            self.book_stresser.cancel()
+
+    def _on_chapter_stressed(self, index: int, original: str, stressed: str) -> None:
+        """Apply a chapter's stresses unless the chapter changed meanwhile (edited, or another book is open)."""
+        if not self.book or index >= len(self.book.chapters) or self.book.chapters[index].text != original:
+            return
+        if index == self.current_index:
+            if self.editor.document().isModified() or self.editor.toPlainText() != original:
+                return  # the user is editing this chapter: their text wins
+            line = self.editor.textCursor().blockNumber()
+            scroll = self.editor.verticalScrollBar().value()
+            self.editor.setPlainText(stressed)
+            self.editor.document().setModified(False)
+            cursor = QTextCursor(self.editor.document().findBlockByNumber(line))
+            self.editor.setTextCursor(cursor)
+            self.editor.verticalScrollBar().setValue(scroll)
+        self.book.chapters[index].text = stressed
 
     def _chapter_menu(self, pos) -> None:
         row = self.chapter_list.indexAt(pos).row()
@@ -951,7 +1080,7 @@ class MainWindow(QMainWindow):
         if missing:
             info += f"<br><b style='color:#c0392b'>Не установлено: {', '.join(missing)}.</b> Команда: <code>{engine.install_hint()}</code>"
         if self._language() not in engine.languages:
-            info += f"<br><b style='color:#c0392b'>Этот движок не поддерживает выбранный язык.</b>"
+            info += "<br><b style='color:#c0392b'>Этот движок не поддерживает выбранный язык.</b>"
         self.engine_info.setText(info)
         stress_row = engine.stress_marks and not engine.builtin_stress
         self.voice_form.setRowVisible(self.auto_stress_check, stress_row)
@@ -961,7 +1090,6 @@ class MainWindow(QMainWindow):
         self.voice_form.setRowVisible(self.pitch_row, "pitch" in engine.style_controls)
         self.voice_form.setRowVisible(self.expression_row, "expressiveness" in engine.style_controls)
         self.voice_form.setRowVisible(self.quality_combo, "quality" in engine.style_controls)
-        self.voice_combo.setEditable(engine.id == "piper")
         self._refresh_voices()
         self._update_reference_rows()
 
@@ -985,7 +1113,7 @@ class MainWindow(QMainWindow):
         """The WAV/transcript fields are only for one-off cloning; library voices carry their own reference."""
         engine = self._engine()
         voice = self.voice_combo.currentData()
-        own = engine.supports_cloning and not is_library_voice(voice) and (engine.id != "xtts" or voice == "__reference__")
+        own = engine.supports_cloning and not is_library_voice(voice)
         self.voice_form.setRowVisible(self.ref_row, own)
         self.voice_form.setRowVisible(self.ref_text_edit, own and engine.needs_reference_text)
 
@@ -1027,7 +1155,7 @@ class MainWindow(QMainWindow):
         self._update_dialogue_rows()
 
     def _dialogue_available(self) -> bool:
-        return self._language() == "ru" and self.male_combo.count() > 1 and self._engine().id != "mms"
+        return self._language() == "ru" and self.male_combo.count() > 1
 
     def _update_dialogue_rows(self, *_) -> None:
         available = self._dialogue_available()
@@ -1071,7 +1199,12 @@ class MainWindow(QMainWindow):
             dialogue_voices=self.dialogue_check.isChecked() and self._dialogue_available(),
             male_voice=self.male_combo.currentData() or "",
             female_voice=self.female_combo.currentData() or "",
+            music=self.music_check.isChecked(),
+            music_volume=self.music_volume.value() / 100,
         )
+
+    def _open_music_dir(self) -> None:
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(music_dir(create=True))))
 
     def _prepare_engine(self, engine: TTSEngine, device: str, settings: SynthSettings, bridge: Bridge) -> None:
         self.engines.ensure_loaded(engine, device, settings.voice, bridge.log.emit)
@@ -1169,7 +1302,8 @@ class MainWindow(QMainWindow):
                   self.ref_text_edit, self.open_button, self.load_button, self.speed_spin, self.numbers_check,
                   self.sentence_pause, self.paragraph_pause, self.preset_combo, self.pitch_row,
                   self.expression_row, self.quality_combo, self.random_row, self.my_voices_row, self.preset_row,
-                  self.dialogue_check, self.male_combo, self.female_combo, self.install_stress_button, self.chime_check):
+                  self.dialogue_check, self.male_combo, self.female_combo, self.install_stress_button, self.melody_check,
+                  self.music_check):
             w.setEnabled(not busy)
         self.export_button.setEnabled(has_book and not busy)
         self.cancel_button.setEnabled(self._busy in ("export", "load", "stress", "install"))
@@ -1217,7 +1351,7 @@ class MainWindow(QMainWindow):
             if error:
                 self._show_error("Не удалось загрузить модель", error)
             else:
-                self._refresh_voices()  # XTTS exposes its speaker list only after loading
+                self._refresh_voices()  # Silero CIS lists its voices only after loading
 
         self._run_task("load", task, done)
 
@@ -1247,14 +1381,14 @@ class MainWindow(QMainWindow):
             start, end = cursor.block().position(), len(text)
             self._read_mode = "chapter"
         settings = self._synth_settings()
-        chime = self.chime_check.isChecked() and self._read_mode == "chapter" and start == 0
+        melody = self.melody_check.isChecked()
+        chapter_start = self._read_mode == "chapter" and start == 0
         device = self.device_combo.currentData()
 
         def task(bridge: Bridge, cancel: threading.Event):
             self._prepare_engine(engine, device, settings, bridge)
             chunks = make_chunks(engine, text, settings, start, end)
-            intro = chapter_chime(engine.sample_rate) if chime else None
-            reader = ReadAloud(engine, settings, chunks, bridge.chunk.emit, bridge.log.emit, intro)
+            reader = ReadAloud(engine, settings, chunks, bridge.chunk.emit, bridge.log.emit, melody, chapter_start)
             self._reader = reader
             if cancel.is_set():  # stop was pressed while the model was loading
                 return False
@@ -1357,7 +1491,7 @@ class MainWindow(QMainWindow):
             single_file=self.single_radio.isChecked(),
             read_titles=self.titles_check.isChecked(),
             skip_existing=self.skip_check.isChecked(),
-            chime=self.chime_check.isChecked(),
+            melody=self.melody_check.isChecked(),
         )
         settings = self._synth_settings()
         device = self.device_combo.currentData()
@@ -1486,31 +1620,46 @@ class MainWindow(QMainWindow):
         if dialog.exec():
             self._log(f"Словарь произношений сохранён: {len(self.dictionary.entries)} слов.")
 
-    def new_voice_from_recording(self, files: list[str] | None = None) -> None:
-        """One step from a voice message to a usable voice: pick (or drop) recordings, the rest is automatic."""
+    def new_voice_from_recording(self, files: list[str] | None = None, folder: bool = False) -> None:
+        """One step from voice messages to a usable voice: pick (or drop) recordings or a folder of them,
+        the rest is automatic."""
         if self._busy or self._training_blocks():
             return
         if not files:
-            start = self.settings.value("train/last_dir", str(Path.home()))
-            files, _ = QFileDialog.getOpenFileNames(self, "Запись голоса: голосовое сообщение, MP3, WAV…", start, AUDIO_FILTER)
+            files = self._ask_recordings(folder)
             if not files:
                 return
-            self.settings.setValue("train/last_dir", str(Path(files[0]).parent))
         self.open_voices()
         self.voices_dialog.create_from_files(files)
+
+    def _ask_recordings(self, folder: bool) -> list[str]:
+        start = self.settings.value("train/last_dir", str(Path.home()))
+        if folder:
+            chosen = QFileDialog.getExistingDirectory(self, "Папка с записями голоса", start)
+            if not chosen:
+                return []
+            self.settings.setValue("train/last_dir", chosen)
+            files = collect_audio([chosen])
+            if not files:
+                QMessageBox.information(self, "Нет записей", f"В папке нет аудиофайлов:\n{chosen}")
+            return files
+        files, _ = QFileDialog.getOpenFileNames(
+            self, "Записи голоса: голосовые сообщения, MP3, WAV… (можно выбрать несколько)", start, AUDIO_FILTER
+        )
+        if files:
+            self.settings.setValue("train/last_dir", str(Path(files[0]).parent))
+        return files
 
     def _on_voice_ready(self, voice_id: str) -> None:
         if self._busy:
             return
-        if not self._engine().supports_cloning:
-            installed = [e for e in ("f5", "xtts") if not self.engines.get(e).missing_requirements()]
-            if installed:
-                self._select_data(self.engine_combo, installed[0])
+        if not self._engine().supports_cloning and not self.engines.get("f5").missing_requirements():
+            self._select_data(self.engine_combo, "f5")
         self._refresh_voices()
         self._select_data(self.voice_combo, voice_id)
         self._update_reference_rows()
         if self.voice_combo.currentData() != voice_id:
-            self._log("Голос готов, но говорить им умеют только F5-TTS и XTTS-v2 — установите их: uv sync --extra all")
+            self._log("Голос готов, но говорить им умеет только F5-TTS — установите его: uv sync --extra all")
             return
         self._log(
             "Голос готов и выбран. Нажмите «Читать», чтобы послушать. "
@@ -1556,7 +1705,7 @@ class MainWindow(QMainWindow):
         if name not in THEMES:
             name = DEFAULT_THEME
         apply_theme(name)
-        self.settings.setValue("theme", name)
+        self.settings.setValue("ui_theme", name)
         self._theme_actions[name].setChecked(True)
         self._update_highlight_color()
 
@@ -1616,7 +1765,7 @@ class MainWindow(QMainWindow):
             self,
             "О программе",
             f"<b>AI Reader {__version__}</b><br>Озвучка книг нейросетевыми моделями.<br><br>"
-            "Движки: Silero TTS, Piper (rhasspy/piper-voices), XTTS-v2 (coqui), F5-TTS, Meta MMS-TTS.<br>"
+            "Движки: Silero TTS (быстрый, без видеокарты) и F5-TTS (клонирование и дообучение голоса).<br>"
             "Форматы книг: TXT, FB2, EPUB, PDF, HTML.<br>Экспорт: MP3, OGG, Opus, FLAC, WAV.",
         )
 
@@ -1627,7 +1776,7 @@ class MainWindow(QMainWindow):
     def dropEvent(self, event) -> None:
         mime = event.mimeData()
         urls = mime.urls()
-        recordings = [u.toLocalFile() for u in urls if u.isLocalFile() and u.toLocalFile().lower().endswith(AUDIO_EXTENSIONS)]
+        recordings = dropped_audio(mime)  # recordings and folders of them
         if recordings:
             self.new_voice_from_recording(recordings)
         elif urls and urls[0].isLocalFile():

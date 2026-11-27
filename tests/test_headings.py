@@ -43,7 +43,7 @@ def test_ordinary_text_is_not_a_heading(paragraph: str) -> None:
 
 
 def test_split_names_chapters_after_their_part() -> None:
-    text = "\n\n".join(["Вступление.", "ЧАСТЬ ПЕРВАЯ", "I", "Текст один.", "II", "Текст два.", "ЭПИЛОГ", "Конец."])
+    text = "Вступление.\n\nЧАСТЬ ПЕРВАЯ\n\nI\n\nТекст один.\n\nII\n\nТекст два.\n\nЭПИЛОГ\n\nКонец."
     chapters = split_by_headings(Chapter("", text))
     assert [(c.title, c.text) for c in chapters] == [
         ("Начало", "Вступление."),

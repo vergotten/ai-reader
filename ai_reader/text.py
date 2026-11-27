@@ -140,7 +140,7 @@ def chunk_text(
 _REPLACEMENTS = str.maketrans(
     {
         "«": '"', "»": '"', "„": '"', "“": '"', "”": '"', "‘": "'", "’": "'",
-        " ": " ", " ": " ", " ": " ", "­": None, "​": None,
+        " ": " ", " ": " ", " ": " ", "­": None, "\u200b": None,
         "*": None, "#": None, "_": None, "|": None, "~": None,
     }
 )

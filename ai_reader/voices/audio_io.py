@@ -5,11 +5,23 @@ from __future__ import annotations
 import shutil
 import subprocess
 import sys
+from pathlib import Path
 
 import numpy as np
 
 AUDIO_EXTENSIONS = (".wav", ".flac", ".mp3", ".ogg", ".oga", ".opus", ".m4a", ".aac", ".mp4", ".webm", ".wma", ".amr", ".3gp")
 AUDIO_FILTER = "Аудио (" + " ".join(f"*{e}" for e in AUDIO_EXTENSIONS) + ");;Все файлы (*)"
+
+
+def collect_audio(paths: list[str]) -> list[str]:
+    """Recordings among the given paths; folders are searched with all their subfolders."""
+    found: list[str] = []
+    for path in map(Path, paths):
+        if path.is_dir():
+            found += sorted(str(p) for p in path.rglob("*") if p.is_file() and p.suffix.lower() in AUDIO_EXTENSIONS)
+        elif path.is_file() and path.suffix.lower() in AUDIO_EXTENSIONS:
+            found.append(str(path))
+    return list(dict.fromkeys(found))
 
 
 def load_audio(path: str, sample_rate: int) -> np.ndarray:

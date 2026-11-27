@@ -7,7 +7,7 @@ import importlib
 import shutil
 import subprocess
 import sys
-from typing import Callable
+from collections.abc import Callable
 
 Log = Callable[[str], None]
 

@@ -19,16 +19,17 @@ from pathlib import Path
 
 TARGET_SAMPLE_RATE = 24_000
 HOP_LENGTH = 256
-MEL_KWARGS = dict(
-    n_fft=1024,
-    hop_length=HOP_LENGTH,
-    win_length=1024,
-    n_mel_channels=100,
-    target_sample_rate=TARGET_SAMPLE_RATE,
-    mel_spec_type="vocos",
-)
-MODEL_CFG = dict(dim=1024, depth=22, heads=16, ff_mult=2, text_dim=512, conv_layers=4)  # F5TTS_v1_Base
-TINY_CFG = dict(dim=64, depth=2, heads=2, ff_mult=2, text_dim=32, conv_layers=1)  # --debug-tiny smoke test only
+MEL_KWARGS = {
+    "n_fft": 1024,
+    "hop_length": HOP_LENGTH,
+    "win_length": 1024,
+    "n_mel_channels": 100,
+    "target_sample_rate": TARGET_SAMPLE_RATE,
+    "mel_spec_type": "vocos",
+}
+MODEL_CFG = {"dim": 1024, "depth": 22, "heads": 16, "ff_mult": 2, "text_dim": 512, "conv_layers": 4}  # F5TTS_v1_Base
+TINY_CFG = {"dim": 64, "depth": 2, "heads": 2, "ff_mult": 2, "text_dim": 32, "conv_layers": 1}  # --debug-tiny smoke test only
+EXIT_OUT_OF_MEMORY = 3  # the window retries with a smaller batch
 
 
 def say(*parts) -> None:
@@ -51,13 +52,10 @@ def parse_args(argv=None):
 
 
 def base_files(base: str) -> tuple[str, str]:
-    from huggingface_hub import hf_hub_download
+    from ai_reader.tts.f5 import F5Engine, base_checkpoint
 
-    from ai_reader.tts.f5 import F5Engine
-
-    repo, ckpt, vocab, label = F5Engine.MODELS[base]
-    say("status", f"Загрузка базовой модели «{label}» (если её ещё нет в кэше)…")
-    return hf_hub_download(repo, ckpt), hf_hub_download(repo, vocab)
+    say("status", f"Базовая модель: «{F5Engine.MODELS[base][3]}».")
+    return base_checkpoint(base, lambda message: say("status", message))
 
 
 def link_or_copy(src: str, dst: Path) -> None:
@@ -68,6 +66,18 @@ def link_or_copy(src: str, dst: Path) -> None:
         os.link(src, dst)
     except OSError:
         shutil.copy2(src, dst)
+
+
+def drop_broken_checkpoint(ckpt_dir: Path) -> None:
+    """F5-TTS writes model_last.pt in place, so a crash or power-off during a save leaves a truncated file
+    that breaks every later start. torch checkpoints are zip archives; a cut-off one has no central directory."""
+    import zipfile
+
+    last = ckpt_dir / "model_last.pt"
+    if last.is_file() and not zipfile.is_zipfile(last):
+        last.unlink()
+        say("status", "Последняя контрольная точка повреждена (обучение прервали во время сохранения) — "
+                      "удалена, начинаю с базовой модели.")
 
 
 def build_dataset(voice):
@@ -124,6 +134,7 @@ def main(argv=None) -> int:
     voice = Voice.load(Path(args.voice_dir))
     ckpt_dir = voice.train_dir / "ckpts"
     ckpt_dir.mkdir(parents=True, exist_ok=True)
+    drop_broken_checkpoint(ckpt_dir)
 
     if args.export_only:
         return 0 if export_model(voice, ckpt_dir) else 1
@@ -156,18 +167,24 @@ def main(argv=None) -> int:
     dataset, clips = build_dataset(voice)
     seconds = sum(c.duration for c in clips)
 
-    total_frames = sum(c.duration for c in clips) * TARGET_SAMPLE_RATE / HOP_LENGTH
+    total_frames = seconds * TARGET_SAMPLE_RATE / HOP_LENGTH
     batches = max(1, math.ceil(total_frames / args.batch_frames))
     updates = math.ceil(batches / args.grad_accum) * args.epochs
     warmup = max(10, min(int(updates * 0.05), 1000))
     save_every = max(20, updates // 20)
-    say("plan", f"clips={len(clips)}", f"minutes={seconds / 60:.1f}", f"updates={updates}", f"epochs={args.epochs}")
+    resumed = (ckpt_dir / "model_last.pt").exists()
+    say("status", f"Данные: {len(clips)} фрагментов, {seconds / 60:.1f} мин речи; базовая модель {args.base}.")
+    say("status", f"План: {args.epochs} эпох × {batches} батчей = {updates} шагов; батч {args.batch_frames} кадров, "
+                  f"скорость обучения {args.learning_rate:g}; контрольная точка каждые {save_every} шагов.")
+    say("status", "Продолжаю с последней контрольной точки." if resumed else "Начинаю с базовой модели.")
 
     mixed = "no"
     if torch.cuda.is_available():
-        major = torch.cuda.get_device_properties(0).major
-        mixed = "bf16" if torch.cuda.is_bf16_supported() and major >= 8 else ("fp16" if major >= 7 else "no")
-        say("status", f"GPU: {torch.cuda.get_device_name(0)}, точность: {mixed}")
+        props = torch.cuda.get_device_properties(0)
+        mixed = "bf16" if torch.cuda.is_bf16_supported() and props.major >= 8 else ("fp16" if props.major >= 7 else "no")
+        free, total = torch.cuda.mem_get_info()
+        say("status", f"Видеокарта: {props.name}, свободно {free / 2**30:.1f} из {total / 2**30:.1f} ГБ, "
+                      f"точность {mixed}, PyTorch {torch.__version__}.")
     else:
         say("status", "Видеокарта не найдена — обучение на CPU будет очень долгим.")
 
@@ -195,11 +212,35 @@ def main(argv=None) -> int:
         accelerate_kwargs={"mixed_precision": mixed},
     )
     started = time.time()
-    trainer.train(dataset, num_workers=max(1, args.workers), resumable_with_seed=666)  # saves model_last.pt at the end
+    say("status", "Обучение началось. Первые шаги идут медленнее, дальше скорость выравнивается.")
+    try:
+        # saves model_last.pt every save_every steps and at the end
+        trainer.train(dataset, num_workers=max(1, args.workers), resumable_with_seed=666)
+    except torch.cuda.OutOfMemoryError:
+        # the window lowers the batch and starts again; training continues from the last checkpoint
+        say("oom", f"Не хватило видеопамяти при батче {args.batch_frames} кадров.")
+        return EXIT_OUT_OF_MEMORY
     say("status", f"Обучение завершено за {(time.time() - started) / 60:.0f} мин.")
     del trainer, model
     return 0 if export_model(voice, ckpt_dir) else 1
 
 
+def run(argv=None) -> int:
+    """main() with every failure reported as an "@@ error" line the window can show as it is."""
+    try:
+        return main(argv)
+    except SystemExit as stop:
+        if isinstance(stop.code, str):
+            say("error", stop.code)
+            return 1
+        raise
+    except Exception as error:
+        import traceback
+
+        traceback.print_exc()
+        say("error", f"{error.__class__.__name__}: {error}")
+        return 1
+
+
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(run())

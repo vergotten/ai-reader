@@ -29,3 +29,7 @@ desktop.ini
 
 # unfinished export files
 *.part
+.vs/
+
+# testers' voice messages and their transcripts are personal data
+feedback/

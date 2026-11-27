@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import itertools
 import re
 from pathlib import Path
 
@@ -39,7 +40,7 @@ def load_pdf(path: Path) -> Book:
         if toc[0][0] > 0:
             chapters.append(Chapter("Начало", join_paragraphs(p for pg in pages[: toc[0][0]] for p in pg)))
         bounds = toc + [(len(pages), "")]
-        for (start, title), (end, _) in zip(bounds, bounds[1:]):
+        for (start, title), (end, _) in itertools.pairwise(bounds):
             chapters.append(Chapter(title, join_paragraphs(p for pg in pages[start:end] for p in pg)))
     else:
         for start in range(0, len(pages), PAGES_PER_PART):

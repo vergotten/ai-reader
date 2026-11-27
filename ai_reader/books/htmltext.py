@@ -24,11 +24,7 @@ def html_to_paragraphs(content: bytes | str) -> tuple[list[str], str | None]:
     for el in doc.iter():
         if not isinstance(el.tag, str):
             continue
-        if el.tag in ("script", "style", "head", "title"):
-            drop.append(el)
-        elif el.get("epub:type") in ("noteref", "footnote", "endnote", "rearnote"):
-            drop.append(el)
-        elif el.tag == "sup" and _FOOTNOTE_MARK.fullmatch(el.text_content() or ""):
+        if el.tag in ("script", "style", "head", "title") or el.get("epub:type") in ("noteref", "footnote", "endnote", "rearnote") or el.tag == "sup" and _FOOTNOTE_MARK.fullmatch(el.text_content() or ""):
             drop.append(el)
     for el in drop:
         if el.getparent() is not None:

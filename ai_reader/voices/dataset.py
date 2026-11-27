@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import os
 import re
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Callable
 
 import numpy as np
 
+from ..paths import download_note
 from .audio_io import load_audio
 from .library import Clip, Voice
 
@@ -196,13 +197,16 @@ def prepare_dataset(
         voice.pick_reference()
     voice.save()
     ok = sum(1 for c, _a in new if c.enabled)
-    log(f"Готово: {len(new)} фрагментов, {ok} годных, {sum(c.duration for c, _a in new if c.enabled) / 60:.1f} мин речи.")
+    minutes = sum(c.duration for c, _a in new if c.enabled) / 60
+    log(f"Готово: {len(new)} фрагментов, {ok} годных, {minutes:.1f} мин речи "
+        f"(всего в голосе {voice.total_seconds() / 60:.1f} мин). Отложенные можно включить в таблице галочкой.")
     return len(new)
 
 
 def _transcribe(items: list[tuple[Clip, np.ndarray]], device_preference: str, log: Log, progress: Progress, cancelled) -> None:
+    import time
+
     import soxr
-    import torch
     from transformers import pipeline
 
     from ..pipeline import Cancelled
@@ -210,9 +214,11 @@ def _transcribe(items: list[tuple[Clip, np.ndarray]], device_preference: str, lo
     from ..tts.base import free_torch_memory, resolve_device
 
     device = resolve_device(device_preference)
-    dtype = torch.float16 if device == "cuda" and torch.cuda.get_device_properties(0).major >= 7 else torch.float32
-    log(f"Whisper: загрузка {ASR_MODEL} ({device}, первый раз скачивается ~1,6 ГБ)…")
-    asr = pipeline("automatic-speech-recognition", model=ASR_MODEL, torch_dtype=dtype, device=device)
+    log(f"Whisper: загрузка {ASR_MODEL} ({device}){download_note(ASR_MODEL, '~1,6 ГБ')}…")
+    started = time.monotonic()
+    asr = pipeline("automatic-speech-recognition", model=_load_whisper(device), tokenizer=ASR_MODEL, feature_extractor=ASR_MODEL)
+    log(f"Whisper загружен за {time.monotonic() - started:.0f} с. Распознаю {len(items)} фрагментов…")
+    started = time.monotonic()
     batch = 8 if device == "cuda" else 2
     try:
         for i in range(0, len(items), batch):
@@ -234,9 +240,35 @@ def _transcribe(items: list[tuple[Clip, np.ndarray]], device_preference: str, lo
                     text += "."
                 clip.text = text
                 clip.enabled = _plausible(text, clip.duration)
+                if not clip.enabled:
+                    log(f"  отложен {clip.file} ({clip.duration:.1f} с): «{text[:60]}» — {_why_rejected(text, clip.duration)}")
+        log(f"Распознавание заняло {time.monotonic() - started:.0f} с.")
     finally:
         del asr
         free_torch_memory()
+
+
+def _load_whisper(device: str):
+    """Whisper with as little RAM as possible: loaded in fp16 (half the memory of fp32) and moved to the GPU.
+    GPUs older than Volta (GTX 10xx) compute fp16 very slowly, so there the weights are widened to fp32 on the
+    GPU itself. (Loading with device_map="cuda" would skip the CPU copy, but crashes on Windows.)"""
+    import torch
+    from transformers import AutoModelForSpeechSeq2Seq
+
+    dtype = torch.float16 if device == "cuda" else torch.float32
+    model = AutoModelForSpeechSeq2Seq.from_pretrained(ASR_MODEL, dtype=dtype, low_cpu_mem_usage=True).to(device)
+    if device == "cuda" and torch.cuda.get_device_properties(0).major < 7:
+        model = model.float()
+    return model
+
+
+def _why_rejected(text: str, duration: float) -> str:
+    letters = len(re.findall(r"[а-яёА-ЯЁ]", text))
+    if letters < 3:
+        return "речь не распознана (шум, музыка или молчание)"
+    if _HALLUCINATIONS.search(text):
+        return "похоже на «галлюцинацию» распознавания"
+    return "текст не совпадает с длиной записи (слишком быстро или медленно для речи)"
 
 
 def _plausible(text: str, duration: float) -> bool:
@@ -245,3 +277,69 @@ def _plausible(text: str, duration: float) -> bool:
         return False
     rate = letters / max(duration, 0.1)
     return 4.0 <= rate <= 22.0
+
+
+# ------------------------------------------------------------------ run as a child process (runner.PrepareProcess)
+
+
+def main(argv: list[str] | None = None) -> int:
+    """python -m ai_reader.voices.dataset --voice-dir DIR --files-from LIST [--device auto] [--no-stress]
+
+    Progress goes to stdout as "@@ progress <done> <total> <what>", a failure as "@@ error <message>".
+    """
+    import argparse
+    import sys
+    from pathlib import Path
+
+    from ..paths import use_models_dir
+    from .library import Voice
+
+    p = argparse.ArgumentParser(description="AI Reader: подготовка записей голоса")
+    p.add_argument("--voice-dir", required=True)
+    p.add_argument("--files-from", required=True, help="текстовый файл: по пути к записи в строке")
+    p.add_argument("--device", default="auto")
+    p.add_argument("--no-stress", action="store_true")
+    args = p.parse_args(argv)
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace", line_buffering=True)
+
+    use_models_dir()
+    files = [line.strip() for line in Path(args.files_from).read_text(encoding="utf-8").splitlines() if line.strip()]
+    voice = Voice.load(Path(args.voice_dir))
+
+    def progress(done: int, total: int, what: str) -> None:
+        print(f"@@ progress {done} {total} {what}", flush=True)
+
+    try:
+        prepare_dataset(voice, files, args.device, lambda m: print(m, flush=True), progress, lambda: False,
+                        add_stress=not args.no_stress)
+    except Exception as error:
+        import traceback
+
+        traceback.print_exc()
+        message = MEMORY_HINT if _out_of_memory(error) else str(error) or error.__class__.__name__
+        print("@@ error " + message.replace("\n", "\\n"), flush=True)  # one line; the window turns it back
+        return 1
+
+
+MEMORY_HINT = (
+    "Не хватило памяти компьютера для распознавания речи (Whisper).\n\n"
+    "Закройте браузер и другие тяжёлые программы и попробуйте снова. Надёжнее — увеличить файл подкачки "
+    "Windows: Параметры → Система → О программе → Дополнительные параметры системы → Быстродействие → "
+    "Параметры → Дополнительно → Виртуальная память → «Автоматически выбирать объём файла подкачки»."
+)
+
+
+def _out_of_memory(error: BaseException) -> bool:
+    """MemoryError, Windows' «the paging file is too small» (1455) or a library's own «out of memory»."""
+    while error is not None:
+        text = str(error).lower()
+        if isinstance(error, MemoryError) or getattr(error, "winerror", None) == 1455 or "1455" in text \
+                or "out of memory" in text or "файл подкачки" in text:
+            return True
+        error = error.__cause__ or error.__context__
+    return False
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

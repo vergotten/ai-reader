@@ -5,16 +5,24 @@ from __future__ import annotations
 import queue
 import re
 import threading
+from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Callable
 
 import numpy as np
 
-from .audio import AudioWriter, chapter_chime, silence, trim_silence, write_chapters, write_tags
-from .dialogue import SPEECH, segment
+from .ambient import MOODS, AmbientMixer, section_moods
+from .audio import (
+    AudioWriter,
+    chapter_melody,
+    silence,
+    trim_silence,
+    write_chapters,
+    write_tags,
+)
 from .books import Book
-from .stress import PronunciationDictionary, strip_stress, stresser
+from .dialogue import SPEECH, segment
+from .stress import PronunciationDictionary, stresser, strip_stress
 from .text import Chunk, chunk_text, is_speakable, normalize
 from .tts import TTSEngine
 from .tts.base import Style
@@ -44,6 +52,8 @@ class SynthSettings:
     male_voice: str = ""
     female_voice: str = ""
     trim: bool = True  # cut the engine's own silence at chunk edges so the pauses above are exact
+    music: bool = False  # quiet background music that follows the mood of the text (ambient.py)
+    music_volume: float = 0.5  # 0..1
 
     def all_voices(self) -> list[str]:
         voices = [self.voice]
@@ -116,6 +126,26 @@ def synth_chunk(engine: TTSEngine, chunk: Chunk, s: SynthSettings) -> np.ndarray
     return audio if audio.size else None
 
 
+def chapter_opening(sr: int, melody: bool, mixer: AmbientMixer | None) -> np.ndarray | None:
+    """What plays before a chapter: the chapter tune (the background music then rises softly under the title),
+    or, without the tune, a few seconds of the chapter's mood music."""
+    if melody:
+        return chapter_melody(sr)
+    return mixer.intro() if mixer is not None else None
+
+
+def make_mixer(sr: int, settings: SynthSettings, chunks: list[Chunk], log: Log, seed: int = 0):
+    """(mixer, mood of every chunk) when background music is on, else (None, [])."""
+    if not settings.music or not chunks:
+        return None, []
+    moods = section_moods([c.text for c in chunks])
+    mixer = AmbientMixer(sr, settings.music_volume, seed, log)
+    mixer.start(moods[0])
+    seen = list(dict.fromkeys(moods))
+    log("Настроение текста: " + " → ".join(MOODS[m] for m in seen))
+    return mixer, moods
+
+
 def prepare_voices(engine: TTSEngine, s: SynthSettings, log: Log) -> None:
     """Download/load whatever the extra dialogue voices need before reading starts; the narrator goes last."""
     for voice in reversed(s.all_voices()):
@@ -140,7 +170,7 @@ class ExportJob:
     single_file: bool = False
     read_titles: bool = True
     chapter_pause: float = 1.5
-    chime: bool = False  # a short soft bell before each chapter, so a new chapter is heard at once
+    melody: bool = True  # the chapter tune before each chapter, so a new chapter is heard at once
     skip_existing: bool = False  # per-chapter export: keep chapter files that are already there
 
 
@@ -168,7 +198,6 @@ def run_export(
     files: list[Path] = []
     writer: AudioWriter | None = None
     marks: list[tuple[str, float]] = []  # chapter markers of a one-file book: (title, start in seconds)
-    chime = chapter_chime(sr) if job.chime else None
 
     def open_writer(path: Path) -> AudioWriter:
         log(f"Запись: {path.name}")
@@ -197,9 +226,11 @@ def run_export(
                 writer = open_writer(target)
             if job.single_file:
                 marks.append((ch.title, writer.duration))
-            if chime is not None:
-                writer.write(chime)
-            for chunk in chunks:
+            mixer, moods = make_mixer(sr, settings, chunks, log, seed=n)
+            opening = chapter_opening(sr, job.melody, mixer)
+            if opening is not None:
+                writer.write(opening)
+            for i, chunk in enumerate(chunks):
                 if cancelled():
                     raise Cancelled
                 try:
@@ -209,13 +240,21 @@ def run_export(
                     log(f"Ошибка синтеза ({e}): «{chunk.text[:80]}»")
                     audio = None
                 if audio is not None:
-                    writer.write(audio)
-                    writer.write(silence(chunk.pause, sr))
+                    piece = np.concatenate([audio, silence(chunk.pause, sr)])
+                    if mixer is not None:
+                        mixer.set_mood(moods[i])
+                        piece = mixer.mix(piece)
+                    writer.write(piece)
                 done += len(chunk.text)
                 progress(done, total, ch.title)
-            if job.single_file:
+            if mixer is not None:
+                fade = mixer.outro(max(3.0, job.chapter_pause))
+                writer.write(fade)
+                if job.single_file and job.chapter_pause > len(fade) / sr:
+                    writer.write(silence(job.chapter_pause - len(fade) / sr, sr))
+            elif job.single_file:
                 writer.write(silence(job.chapter_pause, sr))
-            else:
+            if not job.single_file:
                 files.append(finish(writer, ch.title, book.author, book.title, n, len(plan)))
                 writer = None
         if job.single_file and writer is not None:
@@ -257,9 +296,11 @@ class ReadAloud:
         chunks: list[Chunk],
         on_chunk: Callable[[int, int], None],
         log: Log,
-        intro: np.ndarray | None = None,
+        melody: bool = False,
+        chapter_start: bool = False,
     ) -> None:
-        self.intro = intro
+        self.melody = melody  # the chapter tune (only when reading starts at the beginning of a chapter)
+        self.chapter_start = chapter_start
         self.engine = engine
         self.settings = settings
         self.chunks = chunks
@@ -319,10 +360,14 @@ class ReadAloud:
         producer = threading.Thread(target=self._produce, daemon=True)
         producer.start()
         block = sr // 10
+        mixer, moods = make_mixer(sr, self.settings, self.chunks, self.log)
         stream = _open_output(sd, sr)
         stream.start()
-        if self.intro is not None and self.intro.size:
-            stream.write(self.intro.reshape(-1, 1).astype(np.float32))
+        if self.chapter_start:
+            intro = chapter_opening(sr, self.melody, mixer)
+            if intro is not None and intro.size:
+                stream.write(intro.reshape(-1, 1).astype(np.float32))
+        index = {id(c): i for i, c in enumerate(self.chunks)}
         try:
             while not self._stop.is_set():
                 try:
@@ -331,10 +376,16 @@ class ReadAloud:
                     continue
                 if item is None:
                     self.completed = True
+                    if mixer is not None:  # let the music fade out instead of cutting it
+                        stream.write(mixer.outro().reshape(-1, 1))
                     break
                 chunk, audio = item
                 self.on_chunk(chunk.start, chunk.end)
-                data = np.concatenate([audio, silence(chunk.pause, sr)]).reshape(-1, 1)
+                data = np.concatenate([audio, silence(chunk.pause, sr)])
+                if mixer is not None:
+                    mixer.set_mood(moods[index[id(chunk)]])
+                    data = mixer.mix(data)
+                data = data.reshape(-1, 1)
                 for i in range(0, len(data), block):
                     while not self._resume.wait(0.1):
                         if self._stop.is_set():

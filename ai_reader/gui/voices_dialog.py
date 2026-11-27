@@ -6,9 +6,8 @@ import math
 import shutil
 import threading
 import time
-import traceback
+from collections.abc import Callable
 from pathlib import Path
-from typing import Callable
 
 from PySide6.QtCore import QObject, QSettings, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import QBrush, QColor, QDesktopServices
@@ -39,9 +38,9 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from ..voices.audio_io import AUDIO_EXTENSIONS, AUDIO_FILTER
+from ..voices.audio_io import AUDIO_FILTER, collect_audio
 from ..voices.library import Voice, VoiceLibrary
-from ..voices.runner import TrainProcess, TrainSettings, TrainStatus
+from ..voices.runner import PrepareProcess, TrainProcess, TrainSettings, TrainStatus
 
 MIN_TRAIN_MINUTES = 5
 GOOD_TRAIN_MINUTES = 30
@@ -50,20 +49,51 @@ FRAME_SECONDS = 256 / 24000  # one mel frame (hop 256 at 24 kHz)
 
 
 class _Signals(QObject):
+    """Callbacks from worker threads and child processes, delivered on the GUI thread."""
+
     log = Signal(str)
     progress = Signal(int, int, str)
     done = Signal(object, object)
+    prep_exit = Signal(int)
     train_status = Signal(object)
     train_exit = Signal(int)
 
 
-def _dropped_audio(mime) -> list[str]:
-    paths = [u.toLocalFile() for u in mime.urls() if u.isLocalFile()]
-    return [p for p in paths if p.lower().endswith(AUDIO_EXTENSIONS)]
+def dropped_audio(mime) -> list[str]:
+    """Recordings among dropped files and folders (folders with all their subfolders)."""
+    return collect_audio([u.toLocalFile() for u in mime.urls() if u.isLocalFile()])
 
 
 def _fmt_minutes(seconds: float) -> str:
     return f"{seconds / 60:.1f} мин"
+
+
+def gpu_memory_gb() -> float | None:
+    """Total memory of the NVIDIA card in GB, or None without one."""
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            return torch.cuda.get_device_properties(0).total_memory / 2**30
+    except Exception:
+        pass
+    return None
+
+
+def suggested_batch() -> tuple[int, bool]:
+    """(batch in mel frames, 8-bit optimizer) that fit the card's memory. Too big is not fatal: on running out
+    of memory the training restarts with half the batch and continues from its last checkpoint."""
+    import importlib.util
+
+    gb = gpu_memory_gb() or 0
+    bnb = importlib.util.find_spec("bitsandbytes") is not None
+    for min_gb, frames in ((21, 6400), (14, 4000), (10.5, 2400), (7.5, 1600)):  # cards report a bit under their size
+        if gb >= min_gb:
+            return frames, bnb and gb < 10.5
+    return 800, bnb
+
+
+MIN_BATCH = 400  # below this a fine-tune makes no sense: the card is too small
 
 
 class VoicesDialog(QDialog):
@@ -92,12 +122,11 @@ class VoicesDialog(QDialog):
         self._main_busy = main_busy
         self._main_log = main_log
         self._busy: str | None = None  # None | "prep" | "train"
-        self._cancel: threading.Event | None = None
+        self._prep: PrepareProcess | None = None
         self._train: TrainProcess | None = None
         self._train_voice_id: str | None = None
         self._train_started = 0.0
         self._stopping = False
-        self._prep_signals: _Signals | None = None  # kept alive while a preparation thread runs
         self._filling = False
         self._save_timer = QTimer(self)
         self._save_timer.setSingleShot(True)
@@ -107,6 +136,7 @@ class VoicesDialog(QDialog):
         self.sig = _Signals()
         self.sig.log.connect(self._log)
         self.sig.progress.connect(self._on_progress)
+        self.sig.prep_exit.connect(self._on_prep_exit)
         self.sig.train_status.connect(self._on_train_status)
         self.sig.train_exit.connect(self._on_train_exit)
 
@@ -145,7 +175,7 @@ class VoicesDialog(QDialog):
         for b in (self.new_btn, self.rename_btn, self.delete_btn, folder_btn):
             lv.addWidget(b)
         hint = QLabel(
-            "Голос сразу появляется в движках <b>F5-TTS</b> и <b>XTTS-v2</b> как «★ Имя» — "
+            "Голос сразу появляется в движке <b>F5-TTS</b> как «★ Имя» — "
             "это клонирование по записям. После дообучения F5-TTS звучит заметно ближе к оригиналу."
         )
         hint.setWordWrap(True)
@@ -155,11 +185,19 @@ class VoicesDialog(QDialog):
         right = QWidget()
         rv = QVBoxLayout(right)
 
+        # what to do next, in one sentence; updated after every step
+        self.next_step = QLabel("")
+        self.next_step.setWordWrap(True)
+        self.next_step.setTextFormat(Qt.TextFormat.RichText)
+        self.next_step.setStyleSheet("font-size: 11pt; padding: 6px;")
+        rv.addWidget(self.next_step)
+
         # --- step 1: recordings
         rec = QGroupBox("1. Записи голоса")
         recv = QVBoxLayout(rec)
         intro = QLabel(
-            "Добавьте голосовые сообщения или любые записи речи одного человека (OGG/Opus из Telegram и WhatsApp, "
+            "Добавьте голосовые сообщения или любые записи речи одного человека — файлами или целой папкой "
+            "(OGG/Opus из Telegram и WhatsApp, "
             "MP3, M4A, WAV…). Программа нарежет их по паузам на фрагменты 2–12 с, распознает текст (Whisper) "
             "и расставит ударения. Проверьте тексты: ошибки в них портят обучение. "
             f"Для клонирования хватит минуты речи, для дообучения нужно от {MIN_TRAIN_MINUTES} мин, "
@@ -170,11 +208,15 @@ class VoicesDialog(QDialog):
         row = QHBoxLayout()
         self.add_btn = QPushButton("Добавить записи…")
         self.add_btn.clicked.connect(self._add_recordings)
+        self.add_folder_btn = QPushButton("Добавить папку…")
+        self.add_folder_btn.setToolTip("Все записи из папки и её подпапок сразу")
+        self.add_folder_btn.clicked.connect(self._add_folder)
         self.stress_check = QCheckBox("Ударения в текстах (RUAccent)")
         self.stress_check.setChecked(True)
         self.cancel_btn = QPushButton("Отмена")
         self.cancel_btn.clicked.connect(self._cancel_prep)
         row.addWidget(self.add_btn)
+        row.addWidget(self.add_folder_btn)
         row.addWidget(self.stress_check)
         row.addStretch(1)
         row.addWidget(self.cancel_btn)
@@ -214,9 +256,41 @@ class VoicesDialog(QDialog):
         clip_row.addStretch(1)
         recv.addLayout(clip_row)
 
-        # --- step 2: fine-tuning
-        train = QGroupBox("2. Дообучение F5-TTS (нужна видеокарта NVIDIA, лучше от 8 ГБ)")
-        form = QFormLayout(train)
+        # --- step 2: fine-tuning: one button; the knobs are under «Дополнительно»
+        train = QGroupBox("2. Дообучение (нужна видеокарта NVIDIA)")
+        tv = QVBoxLayout(train)
+        tr = QHBoxLayout()
+        self.train_btn = QPushButton("▶ Дообучить голос")
+        self.train_btn.setProperty("primary", True)
+        self.train_btn.setToolTip("Начать обучение или продолжить с того места, где оно остановилось")
+        self.train_btn.clicked.connect(self._start_training)
+        self.stop_btn = QPushButton("■ Остановить и сохранить")
+        self.stop_btn.clicked.connect(self._stop_training)
+        self.advanced_btn = QPushButton("Дополнительно…")
+        self.advanced_btn.setCheckable(True)
+        tr.addWidget(self.train_btn, 1)
+        tr.addWidget(self.stop_btn)
+        tr.addWidget(self.advanced_btn)
+        tv.addLayout(tr)
+        self.progress = QProgressBar()
+        self.progress.setRange(0, 1000)
+        self.progress.setFormat("")
+        self.progress.setTextVisible(True)
+        tv.addWidget(self.progress)
+        self.train_label = QLabel("")
+        self.train_label.setWordWrap(True)
+        tv.addWidget(self.train_label)
+        self.estimate = QLabel("")
+        self.estimate.setWordWrap(True)
+        self.estimate.setStyleSheet("color: gray;")
+        tv.addWidget(self.estimate)
+
+        advanced = QWidget()
+        form = QFormLayout(advanced)
+        form.setContentsMargins(0, 0, 0, 0)
+        self.advanced_btn.toggled.connect(advanced.setVisible)
+        advanced.setVisible(False)
+        tv.addWidget(advanced)
         from ..tts.f5 import F5Engine
 
         self.base_combo = QComboBox()
@@ -247,41 +321,29 @@ class VoicesDialog(QDialog):
         self.batch_spin.setRange(400, 38400)
         self.batch_spin.setSingleStep(400)
         self.batch_spin.setValue(3200)
-        self.batch_spin.setToolTip("Кадров мел-спектра в батче: 3200 ≈ 34 с аудио, ~8–10 ГБ видеопамяти. При нехватке памяти уменьшите.")
+        self.batch_spin.setToolTip(
+            "Кадров мел-спектра в батче (3200 ≈ 34 с аудио). Подбирается по видеопамяти сам; "
+            "если памяти не хватит, программа уменьшит его и продолжит."
+        )
         self.batch_spin.valueChanged.connect(self._update_train_estimate)
         form.addRow("Размер батча (кадров):", self.batch_spin)
 
         self.bnb_check = QCheckBox("8-битный оптимизатор (меньше видеопамяти, нужен bitsandbytes)")
         form.addRow(self.bnb_check)
 
-        self.estimate = QLabel("")
-        self.estimate.setStyleSheet("color: gray;")
-        form.addRow(self.estimate)
-
-        tr = QHBoxLayout()
-        self.train_btn = QPushButton("Начать / продолжить обучение")
-        self.train_btn.clicked.connect(self._start_training)
-        self.stop_btn = QPushButton("Остановить и сохранить")
-        self.stop_btn.clicked.connect(self._stop_training)
-        self.clean_btn = QPushButton("Удалить файлы обучения")
-        self.clean_btn.setToolTip("Контрольные точки занимают 5–7 ГБ. Готовый голос (model.pt) останется, но продолжить обучение будет нельзя.")
-        self.clean_btn.clicked.connect(self._clean_training)
-        self.export_btn = QPushButton("Сохранить голос")
-        self.export_btn.setToolTip("Сохранить голос из последней контрольной точки (если обучение было прервано)")
+        extra = QHBoxLayout()
+        self.export_btn = QPushButton("Сохранить голос из контрольной точки")
+        self.export_btn.setToolTip("Если обучение было прервано: сохранить то, что уже выучено")
         self.export_btn.clicked.connect(lambda: self._run_trainer(export_only=True))
-        tr.addWidget(self.train_btn, 1)
-        tr.addWidget(self.stop_btn)
-        tr.addWidget(self.export_btn)
-        tr.addWidget(self.clean_btn)
-        form.addRow(tr)
-        self.progress = QProgressBar()
-        self.progress.setRange(0, 1000)
-        self.progress.setFormat("")
-        self.progress.setTextVisible(True)
-        form.addRow(self.progress)
-        self.train_label = QLabel("")
-        self.train_label.setWordWrap(True)
-        form.addRow(self.train_label)
+        self.clean_btn = QPushButton("Удалить файлы обучения")
+        self.clean_btn.setToolTip(
+            "Контрольные точки занимают 5–7 ГБ. Готовый голос останется, но продолжить обучение будет нельзя."
+        )
+        self.clean_btn.clicked.connect(self._clean_training)
+        extra.addWidget(self.export_btn)
+        extra.addWidget(self.clean_btn)
+        extra.addStretch(1)
+        form.addRow(extra)
 
         self.log_view = QPlainTextEdit()
         self.log_view.setReadOnly(True)
@@ -308,8 +370,9 @@ class VoicesDialog(QDialog):
         s = self.settings
         self.epochs_spin.setValue(int(s.value("train/epochs", 60)))
         self.lr_spin.setValue(float(s.value("train/lr", 1e-5)))
-        self.batch_spin.setValue(int(s.value("train/batch", 3200)))
-        self.bnb_check.setChecked(s.value("train/bnb", False, type=bool))
+        batch, bnb = suggested_batch()
+        self.batch_spin.setValue(int(s.value("train/batch", batch)))
+        self.bnb_check.setChecked(s.value("train/bnb", bnb, type=bool))
         self.stress_check.setChecked(s.value("train/stress", True, type=bool))
 
     # ------------------------------------------------------------------ voice list
@@ -493,6 +556,30 @@ class VoicesDialog(QDialog):
             parts.append(f"Для дообучения добавьте ещё записей (нужно от {MIN_TRAIN_MINUTES} мин).")
         self.summary.setText(" ".join(parts))
         self._update_train_estimate()
+        self._update_next_step()
+
+    def _update_next_step(self) -> None:
+        """One line on top of the window: where the user is and what to press next."""
+        v = self.voice
+        if self._busy == "prep":
+            text = "⏳ Готовлю записи: нарезка, распознавание речи, ударения. Ход — в журнале внизу."
+        elif self._busy == "train":
+            text = "⏳ Идёт дообучение. Окно можно закрыть — обучение продолжится; остановить — «■ Остановить и сохранить»."
+        elif not v:
+            text = "<b>Шаг 1.</b> Нажмите «Новый голос…» слева или перетащите сюда записи или папку с ними."
+        elif not v.clips:
+            text = "<b>Шаг 1.</b> Добавьте записи голоса: «Добавить записи…» или «Добавить папку…»."
+        elif v.total_seconds() < MIN_TRAIN_MINUTES * 60:
+            text = (f"✓ Голос уже работает как клон: выберите «★ {v.name}» в движке F5-TTS. "
+                    f"Для дообучения добавьте ещё записей — сейчас {_fmt_minutes(v.total_seconds())}, "
+                    f"нужно от {MIN_TRAIN_MINUTES} мин.")
+        elif v.is_trained:
+            text = (f"✓ Голос дообучен: «★ {v.name} (дообучен)» в движке F5-TTS. "
+                    "Добавили записей — можно дообучить ещё раз.")
+        else:
+            text = (f"<b>Шаг 2.</b> Записей достаточно ({_fmt_minutes(v.total_seconds())}). "
+                    "Проверьте тексты в таблице (необязательно) и нажмите «▶ Дообучить голос».")
+        self.next_step.setText(text)
 
     # ------------------------------------------------------------------ dataset preparation
 
@@ -509,10 +596,24 @@ class VoicesDialog(QDialog):
         if not self.voice or self.busy:
             return
         last_dir = self.settings.value("train/last_dir", str(Path.home()))
-        files, _ = QFileDialog.getOpenFileNames(self, "Записи голоса", last_dir, AUDIO_FILTER)
-        if not files:
+        files, _ = QFileDialog.getOpenFileNames(self, "Записи голоса (можно выбрать несколько)", last_dir, AUDIO_FILTER)
+        if files:
+            self.settings.setValue("train/last_dir", str(Path(files[0]).parent))
+            self._prepare(files)
+
+    def _add_folder(self) -> None:
+        if not self.voice or self.busy:
             return
-        self.settings.setValue("train/last_dir", str(Path(files[0]).parent))
+        folder = QFileDialog.getExistingDirectory(
+            self, "Папка с записями голоса", self.settings.value("train/last_dir", str(Path.home()))
+        )
+        if not folder:
+            return
+        self.settings.setValue("train/last_dir", folder)
+        files = collect_audio([folder])
+        if not files:
+            QMessageBox.information(self, "Нет записей", f"В папке нет аудиофайлов:\n{folder}")
+            return
         self._prepare(files)
 
     def _missing_for_recordings(self, files: list[str]) -> tuple[list[str], list[str]]:
@@ -571,7 +672,7 @@ class VoicesDialog(QDialog):
                 self, "Не хватает компонентов",
                 "Чтобы сделать голос из записей, нужна полная версия программы — в этой сборке нет:\n• "
                 + "\n• ".join(blocking)
-                + "\n\nГолосом из записей говорят движки F5-TTS и XTTS-v2, им тоже нужна полная версия.",
+                + "\n\nГолосом из записей говорит движок F5-TTS, ему тоже нужна полная версия.",
             )
             return
         if installable:
@@ -583,58 +684,59 @@ class VoicesDialog(QDialog):
             if answer == QMessageBox.StandardButton.Yes:
                 self._install_then(installable, lambda: self._prepare(files))
             return
-        self._release_gpu()
-        voice, device, stress = self.voice, self._device_preference(), self.stress_check.isChecked()
-        cancel = threading.Event()
-        self._cancel = cancel
+        self._release_gpu()  # speech recognition needs the memory the reading models hold
         self._busy = "prep"
         self._update_controls()
         self.progress.setValue(0)
-        self._log(f"Подготовка {len(files)} записей для голоса «{voice.name}»…")
-
-        from ..voices.dataset import prepare_dataset
-
-        sig = _Signals()
-        sig.log.connect(self._log)
-        sig.progress.connect(self._on_progress)
-
-        def finished(result, error) -> None:
+        self.progress.setFormat("Запуск…")
+        self._log(f"Подготовка {len(files)} записей для голоса «{self.voice.name}»…")
+        try:
+            self._prep = PrepareProcess(
+                self.voice.dir, files, self._device_preference(), self.stress_check.isChecked(),
+                on_line=self.sig.log.emit, on_progress=self.sig.progress.emit, on_exit=self.sig.prep_exit.emit,
+            )
+        except OSError as e:
             self._busy = None
-            self._cancel = None
             self._update_controls()
-            self.progress.setFormat("")
-            if error is not None:
-                from ..pipeline import Cancelled
+            QMessageBox.critical(self, "Не удалось начать подготовку", str(e))
 
-                if isinstance(error, Cancelled):
-                    self._log("Подготовка отменена.")
-                else:
-                    QMessageBox.critical(self, "Ошибка подготовки", str(error) or error.__class__.__name__)
-            self.voice = self.library.get(voice.id)
-            self._reload_list(voice.id)
-            self._suggest_epochs()
-            self.voices_changed.emit()
-            if error is None and self.voice and self.voice.ref_path:
-                self.voice_ready.emit(self.voice.lib_id)
+    def _on_prep_exit(self, code: int) -> None:
+        prep, self._prep = self._prep, None
+        self._busy = None
+        self.progress.setFormat("")
+        self._reload_list(self.voice.id if self.voice else None)  # the child process wrote the clips: reread
+        self._suggest_epochs()
+        self.voices_changed.emit()
+        self._update_controls()
+        if prep is not None and prep.cancelled:
+            self._log("Подготовка отменена.")
+            return
+        if code != 0:
+            message = (prep.error if prep else "") or "Подробности — в журнале окна."
+            QMessageBox.critical(self, "Ошибка подготовки", message)
+            return
+        self.progress.setValue(1000)
+        if self.voice and self.voice.ref_path:
+            self.voice_ready.emit(self.voice.lib_id)
+        self._offer_training()
 
-        sig.done.connect(finished)
-        self._prep_signals = sig
-
-        def target() -> None:
-            try:
-                n = prepare_dataset(voice, files, device, sig.log.emit, sig.progress.emit, cancel.is_set, stress)
-            except BaseException as e:  # noqa: BLE001
-                if e.__class__.__name__ != "Cancelled":
-                    sig.log.emit(traceback.format_exc())
-                sig.done.emit(None, e)
-            else:
-                sig.done.emit(n, None)
-
-        threading.Thread(target=target, daemon=True, name="ai-reader-dataset").start()
+    def _offer_training(self) -> None:
+        v = self.voice
+        if not v or v.total_seconds() < MIN_TRAIN_MINUTES * 60:
+            return
+        answer = QMessageBox.question(
+            self, "Дообучить голос?",
+            f"Готово: {_fmt_minutes(v.total_seconds())} речи. Голос уже можно выбрать как «★ {v.name}».\n\n"
+            "Начать дообучение сейчас? Так голос станет заметно ближе к оригиналу. "
+            "Обучение идёт в фоне, его можно остановить и продолжить позже.",
+        )
+        if answer == QMessageBox.StandardButton.Yes:
+            self._start_training()
 
     def _cancel_prep(self) -> None:
-        if self._cancel is not None:
-            self._cancel.set()
+        if self._prep is not None:
+            self._prep.cancelled = True
+            self._prep.stop()
             self._log("Отмена…")
 
     def _on_progress(self, done: int, total: int, what: str) -> None:
@@ -686,6 +788,14 @@ class VoicesDialog(QDialog):
         if self._main_busy():
             QMessageBox.information(self, "Занято", "Остановите чтение или экспорт в главном окне: обучению нужна вся видеопамять.")
             return
+        gpu = gpu_memory_gb()
+        if gpu is None:
+            QMessageBox.warning(
+                self, "Нет видеокарты",
+                "Для дообучения нужна видеокарта NVIDIA (лучше от 8 ГБ): на процессоре оно заняло бы сутки.\n\n"
+                f"Голос и без обучения работает как клон — выберите «★ {v.name}» в движке F5-TTS.",
+            )
+            return
         if shutil.disk_usage(v.dir).free < 8 * 1024**3 and not (v.train_dir / "ckpts").exists():
             QMessageBox.warning(self, "Мало места", f"На диске с папкой голосов меньше 8 ГБ свободно:\n{v.dir}")
             return
@@ -712,7 +822,7 @@ class VoicesDialog(QDialog):
             self._train = TrainProcess(
                 v.dir, self._train_settings(),
                 on_line=self.sig.log.emit,
-                on_status=lambda st: self.sig.train_status.emit(TrainStatus(**vars(st))),
+                on_status=self.sig.train_status.emit,
                 on_exit=self.sig.train_exit.emit,
                 export_only=export_only,
             )
@@ -746,12 +856,14 @@ class VoicesDialog(QDialog):
     def _on_train_exit(self, code: int) -> None:
         stopped = self._stopping
         self._stopping = False
-        self._train = None
+        train, self._train = self._train, None
         self._busy = None
         voice = self.library.get(self._train_voice_id)
         if stopped and voice and (voice.train_dir / "ckpts" / "model_last.pt").exists():
             self.voice = voice
             self._run_trainer(export_only=True)  # save what was learned so far
+            return
+        if train is not None and train.out_of_memory and self._retry_smaller_batch(voice):
             return
         self._update_controls()
         if code == 0:
@@ -762,10 +874,29 @@ class VoicesDialog(QDialog):
             self.progress.setFormat("Остановлено")
         else:
             self.progress.setFormat("Ошибка")
-            self._log(f"Процесс обучения завершился с кодом {code} — подробности выше в журнале.")
-            QMessageBox.warning(self, "Обучение", "Обучение завершилось с ошибкой. Подробности — в журнале окна.")
+            reason = train.error if train is not None and train.error else f"код выхода {code}"
+            self._log(f"Обучение остановилось с ошибкой: {reason}")
+            QMessageBox.warning(
+                self, "Обучение",
+                f"Обучение остановилось с ошибкой:\n{reason}\n\nВыученное до этого сохранено в контрольной точке; "
+                "подробности — в журнале окна.",
+            )
         self._reload_list(self._train_voice_id)
         self.voices_changed.emit()
+
+    def _retry_smaller_batch(self, voice: Voice | None) -> bool:
+        """After the GPU ran out of memory: halve the batch and go on from the last checkpoint."""
+        smaller = self.batch_spin.value() // 2 // 100 * 100
+        if voice is None or smaller < MIN_BATCH:
+            self._log("Видеопамяти не хватает даже на самый маленький батч: закройте другие программы, "
+                      "которые используют видеокарту, или включите «8-битный оптимизатор» в «Дополнительно».")
+            return False
+        self._log(f"Не хватило видеопамяти — продолжаю с батчем {smaller} кадров вместо {self.batch_spin.value()}.")
+        self.batch_spin.setValue(smaller)
+        self.settings.setValue("train/batch", smaller)
+        self.voice = voice
+        self._run_trainer(export_only=False)
+        return True
 
     def _clean_training(self) -> None:
         v = self.voice
@@ -789,6 +920,7 @@ class VoicesDialog(QDialog):
         self.rename_btn.setEnabled(has and not busy)
         self.delete_btn.setEnabled(has and not busy)
         self.add_btn.setEnabled(has and not busy)
+        self.add_folder_btn.setEnabled(has and not busy)
         self.stress_check.setEnabled(not busy)
         self.cancel_btn.setEnabled(self._busy == "prep")
         self.table.setEnabled(has and not busy)
@@ -804,6 +936,7 @@ class VoicesDialog(QDialog):
             not self.voice.model_path or last.stat().st_mtime > self.voice.model_path.stat().st_mtime
         )
         self.export_btn.setEnabled(has and not busy and stale)
+        self._update_next_step()
 
     def _log(self, message: str) -> None:
         line = f"[{time.strftime('%H:%M:%S')}] {message.rstrip()}"
@@ -811,11 +944,11 @@ class VoicesDialog(QDialog):
         self._main_log(message)
 
     def dragEnterEvent(self, event) -> None:
-        if _dropped_audio(event.mimeData()):
+        if dropped_audio(event.mimeData()):
             event.acceptProposedAction()
 
     def dropEvent(self, event) -> None:
-        files = _dropped_audio(event.mimeData())
+        files = dropped_audio(event.mimeData())
         if self.voice:
             self._prepare(files)
         else:
