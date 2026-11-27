@@ -27,7 +27,7 @@ def main() -> None:
     try:
         install_bundled_voices()
     except OSError:
-        logging.exception("Could not copy the voices shipped with the app")
+        logging.getLogger(__name__).exception("Could not copy the voices shipped with the app")
 
     from pathlib import Path
 

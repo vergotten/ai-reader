@@ -247,7 +247,8 @@ class MainWindow(QMainWindow):
         scroll.setWidget(right)
         scroll.setWidgetResizable(True)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        scroll.setMinimumWidth(400)
+        # never narrower than the panel's own controls: without a horizontal scrollbar they would be cut off
+        scroll.setMinimumWidth(max(400, right.minimumSizeHint().width() + scroll.verticalScrollBar().sizeHint().width() + 4))
 
         splitter.addWidget(left)
         splitter.addWidget(center)

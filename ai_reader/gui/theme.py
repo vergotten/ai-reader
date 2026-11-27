@@ -301,6 +301,21 @@ def _rgba(color: QColor, alpha: float) -> str:
     return f"rgba({color.red()}, {color.green()}, {color.blue()}, {alpha:.2f})"
 
 
+def _check_mark(color: QColor) -> str:
+    """Path of a small check-mark SVG in `color` for the item-view indicators (a stylesheet can only take files)."""
+    from ..paths import data_dir
+
+    path = data_dir() / "theme" / f"check-{color.name()[1:]}.svg"
+    if not path.is_file():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16"><path d="M3.5 8.5l3 3 6-7" fill="none" '
+            f'stroke="{color.name()}" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></svg>',
+            encoding="utf-8",
+        )
+    return path.as_posix()
+
+
 def _stylesheet(theme: Theme) -> str:
     """Rounded translucent cards over the patterned background, accent buttons, slim scrollbars."""
     window, base, text = QColor(theme.window), QColor(theme.base), QColor(theme.text)
@@ -340,6 +355,12 @@ def _stylesheet(theme: Theme) -> str:
     }}
     QLineEdit {{ padding: 3px 8px; }}
     QLineEdit:focus, QPlainTextEdit:focus, QTextEdit:focus {{ border: 1px solid {_rgba(accent, 0.8)}; }}
+    QListView::indicator, QTreeView::indicator, QTableView::indicator {{
+        width: 14px; height: 14px; border: 1px solid {_rgba(text, 0.45)}; border-radius: 4px; background: {base.name()};
+    }}
+    QListView::indicator:checked, QTreeView::indicator:checked, QTableView::indicator:checked {{
+        background: {accent.name()}; border-color: {accent.name()}; image: url({_check_mark(white)});
+    }}
     QListWidget::item, QTreeWidget::item {{ padding: 3px 4px; border-radius: 6px; }}
     QListWidget::item:hover, QTreeWidget::item:hover {{ background: {_rgba(accent, 0.15)}; }}
     QListWidget::item:selected, QTreeWidget::item:selected {{ background: {_rgba(accent, 0.8)}; color: #ffffff; }}
